@@ -17,8 +17,8 @@
 #include <sys/mman.h>
 
 #define BLOCK_SIZE   4096
-#define TOTAL_BLOCKS 4096  // 16MB
-#define REPEAT       3
+#define TOTAL_BLOCKS 32768  // 128MB（> 8480+ 的 105MB L3，确保真正冷、测量更稳）
+#define REPEAT       5      // 每个配置重复次数，取平均抗噪
 
 static double wall_time_sec(void) {
     struct timespec ts;
@@ -37,7 +37,7 @@ static void flush_cache(void) {
     (void)sink;
 }
 
-// CPU 冷页基线：16MB 连续 4KB 块逐个 memcpy（flush 后，超出 cache）。
+// CPU 冷页基线：128MB 连续 4KB 块逐个 memcpy（flush 后，超出 L3）。
 static double bench_cpu_cold(uint8_t *src, uint8_t *dst) {
     flush_cache();
     double w0 = wall_time_sec();
