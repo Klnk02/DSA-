@@ -9,7 +9,8 @@
 | `stage2-benchmark/` | 阶段 2 核心基准 | CPU vs DSA 吞吐矩阵、盈亏平衡、CPU 释放率 |
 | `stage3-async/` | 阶段 3 异步释放 | 真异步卸载的 CPU 释放测量 |
 | `stage3-batch/` | 阶段 3 Batch 打包 | 4KB 页操作批量提交测试 |
-| `stage4-sandbox/` | 阶段 4 沙箱集成 | （待产出） |
+| `stage4-scene/` | 阶段 4.1 场景建模 | 散落页 batch + 页温度 |
+| `stage4-sandbox/` | 阶段 4.2+ 沙箱集成 | （待产出） |
 | `stage5-report/` | 阶段 5 结论报告 | （待产出） |
 
 ## 已产出
@@ -19,3 +20,4 @@
 - `stage2-benchmark/cpu_time_offload.csv` — `dsa_offload.cc` 实测（吞吐/占用率/每 GB CPU 时间），佐证大块吞吐 1.92× 及「同步 busy-poll 不释放」。
 - `stage3-async/cpu_offload_async.csv` — `dsa_async_offload.c` 实测的四种模式 CPU 占用对比（异步释放率 89.76%，umwait 只省电不释放）。
 - `stage3-batch/batch_4k.csv` — `dsa_batch_4k.c` 实测的 4KB 页操作 Batch 打包吞吐（存在尖锐批量效率阈值 N≈48，N≥48 反超 CPU 5~11 倍）。
+- `stage4-scene/scene_4k.csv` — `dsa_scene_4k.c` 实测（散落页 batch 物理前提成立；页温度决定 5~11× 仅在冷页成立，热页缩水到 1~2.5×）。

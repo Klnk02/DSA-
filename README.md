@@ -124,6 +124,17 @@
 | 4.3 FFI PoC | Rust 调 `dml_submit_job` 提交一个 DSA 作业并等完成 | 证明 Rust→DSA 链路通 |
 | 4.4 接入端到端 | 选 1~2 条热路径接 DSA，A/B 对比 checkpoint/resume | 端到端收益数据 |
 
+**4.1 场景建模初步实测**（2026-10-12，`dsa_scene_4k.c`，数据见 [results/stage4-scene/scene_4k.csv](results/stage4-scene/scene_4k.csv)）：
+
+| 页状态 | CPU 基线 | DSA batch 反超（N=48~256） |
+|---|---|---|
+| 冷页（128MB flush） | 9.22 GB/s | 4.8~10.6× |
+| 热页（64KB cache 常驻） | 38.57 GB/s | 1.1~2.5× |
+
+- **散落页 batch 物理前提成立**：N≥48 后散落/连续吞吐 ≈ 1.00×（物理散落的 4KB 页打包进 batch 不损失吞吐），Data Stream Offload 物理可行。
+- **5~11× 只在冷页成立**：热页 CPU 靠 cache（38.57 GB/s，热/冷比 4.18×），DSA 反超缩水到 1~2.5×（仍正收益）。snapshot 实际收益取决于页温度分布。
+- **异常待留意**：N=32 散落（11.88 GB/s）反比连续（4.50）快 2.64×，发生在负收益区不影响结论；N=64 散落单点波动大（38.8~54.3）。
+
 ## 五、脚本清单
 
 > 各阶段实测结果留痕见 [results/](results/README.md)，本文档只保留结论摘要与指针。
@@ -185,5 +196,6 @@ sudo accel-config disable-device dsa2
 - ✅ 阶段 1 完成（DSA 已启用，`/dev/dsa` 节点生成）。
 - 🔄 阶段 2 进行中：memcpy/fill 吞吐对比已出（盈亏平衡 ~1MB，见上文）；compare/delta/CRC 待测。
 - ✅ 阶段 3 完成：真异步释放 89.76% + 4KB Batch（N≥48 反超 CPU 5~11 倍），见上文。
-- 📋 阶段 4 规划中：散落页 batch + 页温度（场景建模 4.1）、搬运占比（4.2）、Rust FFI PoC（4.3）、端到端接入（4.4），见上文。
+- ✅ 阶段 4.1 完成：散落页 batch 物理前提成立 + 页温度（5~11× 仅冷页成立），见上文。
+- 📋 阶段 4.2-4.4 待推进：搬运占比（4.2）、Rust FFI PoC（4.3）、端到端接入（4.4）。
 - ⏸ 阶段 5 待推进。
