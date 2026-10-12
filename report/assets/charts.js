@@ -216,8 +216,8 @@
   function chartBatch(c) {
     var el = init('chart-batch');
     if (!el) return;
-    var n = [4, 8, 16, 32, 64, 128, 256];
-    var t = [1.62, 3.08, 3.80, 4.43, 39.77, 52.61, 65.28];
+    var n = [4, 8, 16, 32, 48, 56, 64, 72, 96, 128, 256];
+    var t = [2.17, 3.36, 4.04, 4.60, 43.94, 48.96, 53.03, 56.23, 66.23, 75.59, 94.29];
 
     el.setOption(Object.assign({}, baseOption(c), {
       grid: { left: 58, right: 28, top: 48, bottom: 48 },
@@ -246,26 +246,26 @@
           label: {
             show: true, position: 'top', distance: 8, fontWeight: 700, fontSize: 11,
             color: c.accent2,
-            formatter: function (p) { return p.value >= 39 ? p.value.toFixed(1) : ''; }
+            formatter: function (p) { return p.value >= 43 ? p.value.toFixed(1) : ''; }
           },
           markLine: {
             silent: true, symbol: 'none',
             data: [
               {
-                xAxis: 64, name: '批量阈值 N=64',
+                xAxis: 48, name: '批量阈值 N≈48',
                 lineStyle: { type: 'dashed', color: c.warn, width: 1.5 },
-                label: { formatter: '批量阈值 N=64', color: c.warnInk, fontSize: 11, position: 'insideEndTop' }
+                label: { formatter: '批量阈值 N≈48', color: c.warnInk, fontSize: 11, position: 'insideEndTop' }
               },
               {
-                yAxis: 7.9, name: 'CPU 冷拷贝基线 7.9',
+                yAxis: 8.55, name: 'CPU 冷拷贝基线 8.55',
                 lineStyle: { type: 'dashed', color: c.neutral, width: 1 },
-                label: { formatter: 'CPU 冷拷贝基线 7.9', color: c.neutral, fontSize: 11, position: 'insideEndBottom' }
+                label: { formatter: 'CPU 冷拷贝基线 8.55', color: c.neutral, fontSize: 11, position: 'insideEndBottom' }
               }
             ]
           }
         },
         {
-          name: 'CPU 冷拷贝基线 7.9', type: 'line', data: [],
+          name: 'CPU 冷拷贝基线 8.55', type: 'line', data: [],
           lineStyle: { opacity: 0 }, itemStyle: { opacity: 0 }
         }
       ]

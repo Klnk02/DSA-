@@ -186,7 +186,7 @@
 
         <div class="metric-grid">
           <div class="metric"><div class="num">89.76%</div><div class="lbl">异步卸载的 CPU 释放率</div></div>
-          <div class="metric"><div class="num green">5~8×</div><div class="lbl">Batch 攒批（≥64 页）吞吐反超</div></div>
+          <div class="metric"><div class="num green">5~11×</div><div class="lbl">Batch 攒批（≥48 页）吞吐反超</div></div>
           <div class="metric"><div class="num">78×</div><div class="lbl">单发 4KB 相对 CPU 的劣势</div></div>
           <div class="metric"><div class="num">≈1MB</div><div class="lbl">单发吞吐盈亏平衡尺寸</div></div>
         </div>
@@ -303,28 +303,32 @@
         <p>既然单发 4KB 慢 78×，问题就变成：<strong>把 N 个 4KB 页操作打包成一个 batch、只付一次提交开销，能否挽回？</strong>在冷数据（16MB 连续 4KB 块，防 cache 预热假象）下扫描 batch 大小 N。</p>
 
         <figure class="chart-figure">
-          <figcaption>图 3：4KB 页操作 Batch 打包吞吐 vs batch 大小 N（虚线为 CPU 冷拷贝基线 7.9 GB/s）</figcaption>
+          <figcaption>图 3：4KB 页操作 Batch 打包吞吐 vs batch 大小 N（虚线为 CPU 冷拷贝基线 8.55 GB/s）</figcaption>
           <div id="chart-batch" class="chart-box"></div>
         </figure>
 
         <div class="table-wrap">
           <table>
-            <thead><tr><th>batch 大小 N</th><th class="num">总数据量</th><th class="num">吞吐 (GB/s)</th><th>vs CPU(7.9)</th></tr></thead>
+            <thead><tr><th>batch 大小 N</th><th class="num">总数据量</th><th class="num">吞吐 (GB/s)</th><th>vs CPU(8.55)</th></tr></thead>
             <tbody>
-              <tr><td>4</td><td class="num">16 KB</td><td class="num">1.62</td><td>0.21×</td></tr>
-              <tr><td>8</td><td class="num">32 KB</td><td class="num">3.08</td><td>0.39×</td></tr>
-              <tr><td>16</td><td class="num">64 KB</td><td class="num">3.80</td><td>0.48×</td></tr>
-              <tr><td>32</td><td class="num">128 KB</td><td class="num">4.43</td><td>0.56×</td></tr>
-              <tr><td>64</td><td class="num">256 KB</td><td class="num hl">39.77</td><td class="hl" style="color:var(--accent2)">5.03×</td></tr>
-              <tr><td>128</td><td class="num">512 KB</td><td class="num">52.61</td><td>6.66×</td></tr>
-              <tr><td>256</td><td class="num">1 MB</td><td class="num">65.28</td><td class="hl" style="color:var(--accent2)">8.26×</td></tr>
+              <tr><td>4</td><td class="num">16 KB</td><td class="num">2.17</td><td>0.25×</td></tr>
+              <tr><td>8</td><td class="num">32 KB</td><td class="num">3.36</td><td>0.39×</td></tr>
+              <tr><td>16</td><td class="num">64 KB</td><td class="num">4.04</td><td>0.47×</td></tr>
+              <tr><td>32</td><td class="num">128 KB</td><td class="num">4.60</td><td>0.53×</td></tr>
+              <tr><td>48</td><td class="num">192 KB</td><td class="num hl">43.94</td><td class="hl" style="color:var(--accent2)">5.14×</td></tr>
+              <tr><td>56</td><td class="num">224 KB</td><td class="num">48.96</td><td>5.73×</td></tr>
+              <tr><td>64</td><td class="num">256 KB</td><td class="num">53.03</td><td>6.20×</td></tr>
+              <tr><td>72</td><td class="num">288 KB</td><td class="num">56.23</td><td>6.58×</td></tr>
+              <tr><td>96</td><td class="num">384 KB</td><td class="num">66.23</td><td>7.75×</td></tr>
+              <tr><td>128</td><td class="num">512 KB</td><td class="num">75.59</td><td>8.84×</td></tr>
+              <tr><td>256</td><td class="num">1 MB</td><td class="num hl" style="color:var(--accent2)">94.29</td><td class="hl" style="color:var(--accent2)">11.03×</td></tr>
             </tbody>
           </table>
         </div>
 
         <div class="callout green">
           <div class="t">结论 4.3</div>
-          <p style="margin:0">存在明显的<strong>批量效率阈值 N≈64</strong>：N&lt;64 时 DML/DSA 未真正批量（仍逐个提交），吞吐仅 1.6~4.4 GB/s；N≥64 才发挥批量效率，吞吐跳到 <strong>39.8 GB/s 起、最多 65.3 GB/s，反超 CPU 冷拷贝 5~8 倍</strong>。沙箱的快照/dirty-page/zeropage 天然是海量 4KB 页批量操作，正合适攒批。</p>
+          <p style="margin:0">存在明显的<strong>尖锐批量效率阈值 N≈48</strong>：N≤32 时 DML/DSA 未真正批量（仍逐个提交），吞吐仅 2.2~4.6 GB/s；N=48 起吞吐跳变（4.6 → 43.9 GB/s），此后 <strong>43.9 GB/s 起、最多 94.3 GB/s，反超 CPU 冷拷贝 5~11 倍</strong>。沙箱的快照/dirty-page/zeropage 天然是海量 4KB 页批量操作，正合适攒批。</p>
         </div>
       </section>
 
@@ -335,7 +339,7 @@
         <ol>
           <li><strong>盈亏平衡存在</strong>：单发 DSA 在小尺寸是负收益（4KB 慢 78×，固定开销 ~4.8µs），盈亏平衡约 1MB。<strong>「随手卸载小内存操作」不可行</strong>。</li>
           <li><strong>真正的价值在「CPU 释放」而非「吞吐提速」</strong>：大块搬运 DSA 吞吐只是略快/打平，但异步卸载能<strong>把搬运占用的 CPU 时间省掉 89.76%</strong>——这才是沙箱收益的来源。</li>
-          <li><strong>小尺寸靠 Batch 攒批兑现</strong>：4KB 页操作打包到 ≥64 个，DSA 反超 CPU 冷拷贝 5~8 倍。<strong>没有 Batch 能力，加速器对沙箱基本无用</strong>。</li>
+          <li><strong>小尺寸靠 Batch 攒批兑现</strong>：4KB 页操作打包到 ≈48 个（约 192KB），DSA 反超 CPU 冷拷贝 5~11 倍。<strong>没有 Batch 能力，加速器对沙箱基本无用</strong>。</li>
         </ol>
       </section>
 

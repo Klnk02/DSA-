@@ -18,4 +18,4 @@
 - `stage2-benchmark/memcpy_fill_cpu_vs_dsa.csv` — 从原始结果提炼的 CPU vs DSA 吞吐对比矩阵（单位 GiB/s，易读易画图）。
 - `stage2-benchmark/cpu_time_offload.csv` — `dsa_offload.cc` 实测（吞吐/占用率/每 GB CPU 时间），佐证大块吞吐 1.92× 及「同步 busy-poll 不释放」。
 - `stage3-async/cpu_offload_async.csv` — `dsa_async_offload.c` 实测的四种模式 CPU 占用对比（异步释放率 89.76%，umwait 只省电不释放）。
-- `stage3-batch/batch_4k.csv` — `dsa_batch_4k.c` 实测的 4KB 页操作 Batch 打包吞吐（存在批量效率阈值 N≈64，N≥64 反超 CPU 5~8 倍）。
+- `stage3-batch/batch_4k.csv` — `dsa_batch_4k.c` 实测的 4KB 页操作 Batch 打包吞吐（存在尖锐批量效率阈值 N≈48，N≥48 反超 CPU 5~11 倍）。
