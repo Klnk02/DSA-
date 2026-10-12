@@ -1,0 +1,5 @@
+# dsa_offload.cc 实测：搬运 4GB（2MB × 2000 次）CPU 时间对比（2026-10-12，8480+）
+# 说明：DML dedicated 队列为同步 busy-poll，CPU 占用率 ~100%，故「节省率 48%」本质来自 DSA 吞吐 1.92×，而非异步释放。
+path,throughput_gbps,cpu_occupancy_pct,cpu_time_per_gb_s
+cpu_memcpy,14.38,99.95,0.0663
+dsa_memmove_sync_busypoll,27.66,99.91,0.0345

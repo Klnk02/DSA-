@@ -1,0 +1,11 @@
+# dsa_async_offload.c 实测：真异步卸载的 CPU 释放（2026-10-12，8480+，2MB × 2000 = 4GB）
+# 指标：每 GB CPU 时间（CLOCK_PROCESS_CPUTIME_ID）；占用率 = CPU时间/墙钟时间。
+# 结论：DML 低层 dml_submit_job 是真异步；async+sleep 释放率 89.76%；umwait 只省电不释放（占用率仍 ~100%）。
+mode,occupancy_pct,cpu_time_per_gb_ms,wall_time_s
+cpu_memcpy,99.72,82.9,0.3487
+dsa_sync_busypoll,99.97,35.0,0.1468
+dsa_async_sleep,8.19,8.5,0.4345
+dsa_async_umwait,99.96,35.1,0.1473
+
+# 释放率（async+sleep vs CPU memcpy）= 89.76%
+# 换算：vCPU 可用资源提升 = 搬运占比 × 89.76%（搬运占比需阶段 4 沙箱集成实测）
