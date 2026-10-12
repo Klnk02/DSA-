@@ -18,7 +18,7 @@
 
 #define BLOCK_SIZE   4096
 #define TOTAL_BLOCKS 32768  // 128MB（> 8480+ 的 105MB L3，确保真正冷、测量更稳）
-#define REPEAT       5      // 每个配置重复次数，取平均抗噪
+#define REPEAT       15     // 每个配置重复次数，取平均 + min~max 抗偶然性
 
 static double wall_time_sec(void) {
     struct timespec ts;
@@ -123,8 +123,21 @@ static void free_scattered(uint8_t **ptrs) {
     free(ptrs);
 }
 
+// 计算平均值与最小值~最大值范围，观察波动（抗偶然性）
+static void stats(const double *v, int n, double *avg, double *lo, double *hi) {
+    double s = v[0], mn = v[0], mx = v[0];
+    for (int i = 1; i < n; i++) {
+        s += v[i];
+        if (v[i] < mn) mn = v[i];
+        if (v[i] > mx) mx = v[i];
+    }
+    *avg = s / n;
+    *lo = mn;
+    *hi = mx;
+}
+
 int main(void) {
-    // 连续 16MB
+    // 连续 128MB
     uint8_t *src_c = malloc((size_t)TOTAL_BLOCKS * BLOCK_SIZE);
     uint8_t *dst_c = malloc((size_t)TOTAL_BLOCKS * BLOCK_SIZE);
     if (!src_c || !dst_c) { perror("malloc"); return 1; }
@@ -136,27 +149,31 @@ int main(void) {
     uint8_t **dst_s = alloc_scattered(0x00);
 
     // ---- 页温度：CPU 冷/热基线 ----
-    double cold = 0.0, hot = 0.0;
-    for (int r = 0; r < REPEAT; r++) cold += bench_cpu_cold(src_c, dst_c);
-    for (int r = 0; r < REPEAT; r++) hot += bench_cpu_hot();
-    cold /= REPEAT; hot /= REPEAT;
-    printf("[CPU 冷页基线 (16MB flush)] %.2f GB/s\n", cold);
-    printf("[CPU 热页基线 (64KB cache)]  %.2f GB/s\n", hot);
+    double cold_v[REPEAT], hot_v[REPEAT];
+    for (int r = 0; r < REPEAT; r++) cold_v[r] = bench_cpu_cold(src_c, dst_c);
+    for (int r = 0; r < REPEAT; r++) hot_v[r] = bench_cpu_hot();
+    double cold, cold_lo, cold_hi, hot, hot_lo, hot_hi;
+    stats(cold_v, REPEAT, &cold, &cold_lo, &cold_hi);
+    stats(hot_v, REPEAT, &hot, &hot_lo, &hot_hi);
+    printf("[CPU 冷页基线 (128MB flush)] %.2f GB/s  [%5.2f ~ %5.2f]\n", cold, cold_lo, cold_hi);
+    printf("[CPU 热页基线 (64KB cache)]  %.2f GB/s  [%5.2f ~ %5.2f]\n", hot, hot_lo, hot_hi);
     printf("热/冷比 %.2fx  => 页越冷，CPU 掉速越多，DSA 反超空间越大\n\n", hot / cold);
 
     // ---- 散落页 batch vs 连续 batch（N 扫描，阈值附近 + 典型值）----
     int ns[] = {32, 48, 64, 128, 256};
-    printf("%-8s | %-16s | %-16s\n", "N", "连续 batch GB/s", "散落 batch GB/s");
+    printf("%-6s | %-28s | %-28s\n", "N", "连续 batch GB/s", "散落 batch GB/s");
     for (size_t k = 0; k < sizeof(ns) / sizeof(ns[0]); k++) {
         int n = ns[k];
-        double sum_c = 0.0, sum_s = 0.0;
+        double cv[REPEAT], sv[REPEAT];
         for (int r = 0; r < REPEAT; r++)
-            sum_c += bench_dsa_batch(src_c, dst_c, NULL, NULL, 0, n);
+            cv[r] = bench_dsa_batch(src_c, dst_c, NULL, NULL, 0, n);
         for (int r = 0; r < REPEAT; r++)
-            sum_s += bench_dsa_batch(NULL, NULL, src_s, dst_s, 1, n);
-        double avg_c = sum_c / REPEAT, avg_s = sum_s / REPEAT;
-        printf("%-8d | %-16.2f | %-16.2f  (散落/连续 %.2fx)\n",
-               n, avg_c, avg_s, avg_s / avg_c);
+            sv[r] = bench_dsa_batch(NULL, NULL, src_s, dst_s, 1, n);
+        double ac, clo, chi, as, slo, shi;
+        stats(cv, REPEAT, &ac, &clo, &chi);
+        stats(sv, REPEAT, &as, &slo, &shi);
+        printf("%-6d | %8.2f [%6.2f ~ %6.2f] | %8.2f [%6.2f ~ %6.2f]  (散落/连续 %.2fx)\n",
+               n, ac, clo, chi, as, slo, shi, as / ac);
     }
 
     free(src_c); free(dst_c);
