@@ -15,6 +15,7 @@
 
 #define BLOCK_SIZE   4096
 #define TOTAL_BLOCKS 4096  // 16MB
+#define REPEAT       3      // 每个配置重复次数，取平均抗噪，验证跳变是否稳定
 
 static double wall_time_sec(void) {
     struct timespec ts;
@@ -69,6 +70,7 @@ static double bench_dsa_batch_4k(uint8_t *src, uint8_t *dst, int n) {
     job->destination_first_ptr = batch;
     job->destination_length = batch_bytes;
 
+    // n 不整除时余下几块不测，吞吐按实际搬运字节数算，避免 n=48/56/72 时被高估
     int batches = TOTAL_BLOCKS / n;
     flush_cache();
     double w0 = wall_time_sec();
@@ -83,7 +85,8 @@ static double bench_dsa_batch_4k(uint8_t *src, uint8_t *dst, int n) {
         dml_execute_job(job, DML_WAIT_MODE_BUSY_POLL);
     }
     double w1 = wall_time_sec();
-    double gbs = (double)TOTAL_BLOCKS * BLOCK_SIZE / 1e9 / (w1 - w0);
+    double moved = (double)((size_t)batches * (size_t)n) * BLOCK_SIZE;
+    double gbs = moved / 1e9 / (w1 - w0);
 
     dml_finalize_job(job);
     free(batch);
@@ -98,14 +101,24 @@ int main(void) {
     memset(src, 0x5A, (size_t)TOTAL_BLOCKS * BLOCK_SIZE);
     memset(dst, 0x00, (size_t)TOTAL_BLOCKS * BLOCK_SIZE);
 
-    double cpu_gbs = bench_cpu_4k(src, dst);
-    printf("[CPU 4KB memcpy]       %.2f GB/s\n", cpu_gbs);
+    double cpu_gbs = 0.0;
+    for (int r = 0; r < REPEAT; r++) cpu_gbs += bench_cpu_4k(src, dst);
+    cpu_gbs /= REPEAT;
+    printf("[CPU 4KB memcpy]       %.2f GB/s (avg of %d)\n", cpu_gbs, REPEAT);
 
-    int ns[] = {4, 8, 16, 32, 64, 128, 256};
+    // 加密采样：重点覆盖阈值附近 48~96，验证 N≈64 的跳变是尖锐阈值还是渐变
+    int ns[] = {4, 8, 16, 32, 48, 56, 64, 72, 96, 128, 256};
     for (size_t k = 0; k < sizeof(ns) / sizeof(ns[0]); k++) {
         int n = ns[k];
-        double gbs = bench_dsa_batch_4k(src, dst, n);
-        printf("[DSA batch %3d x 4KB] %.2f GB/s  (%.2fx CPU)\n", n, gbs, gbs / cpu_gbs);
+        double sum = 0.0;
+        printf("[DSA batch %3d x 4KB] ", n);
+        for (int r = 0; r < REPEAT; r++) {
+            double gbs = bench_dsa_batch_4k(src, dst, n);
+            sum += gbs;
+            printf("%6.2f%s", gbs, r + 1 < REPEAT ? " |" : "");
+        }
+        double avg = sum / REPEAT;
+        printf("   avg %.2f GB/s (%.2fx CPU)\n", avg, avg / cpu_gbs);
     }
 
     free(src);
