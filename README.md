@@ -74,9 +74,10 @@
 - **性质**：改设备状态（仅 `dsa*`，不碰 IAA 的 `iax*`），需 root。
 - **配置**：每颗 DSA 配 1 个 dedicated 队列（`wq{idx}.0`，独占 `engine{idx}.0`）+ 1 个 shared 队列（`wq{idx}.1`，ENQCMD/SVA 共享 `engine{idx}.1`），其中 `{idx}` 为设备编号（`dsa0→0`、`dsa2→2`）。
 - **用法**：`sudo bash setup_dsa.sh`（幂等，可重复执行）。
-- **两个前置条件（踩过的坑）**：
+- **三个前置条件（踩过的坑）**：
   1. 内核启动参数**必须去掉 `iommu=pt`**，否则 PASID 挂载失败，user 队列无法启用。正确为 `intel_iommu=on,sm_on`。
   2. user 队列**必须显式 `--driver-name=user`**，否则 `enable-wq` 报 `IDXD_SCMD_WQ_NO_DRV_NAME (0x80200000)`。注意 `driver_name ≠ name`，是两个不同字段。
+  3. shared 队列**必须显式 `--threshold`**（>0 且 ≤ wq-size-1），否则报 `threshold not set (0x80060000)`。dedicated 不需要 threshold。
 - **回滚**：
 
 ```bash
