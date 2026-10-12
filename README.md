@@ -106,6 +106,24 @@
 | 快照恢复（磁盘→内存） | 拷贝 | memcpy |
 | 零拷贝 / Direct I/O 搬移 | 拷贝 | memcpy |
 
+### 阶段 4 规划（沙箱集成）
+
+**目标**：把 DSA 接入 Firecracker 的 1~2 条 mem2mem 热路径，端到端量化「搬运占比」与「实际收益」，并回答两个阶段 3 遗留的技术前提。
+
+**阶段 3 带入的遗留问题（接入前必须先回答）：**
+
+1. **散落页 batch 是否仍有效**：阶段 3 的 `dsa_batch_4k.c` 用「16MB 连续内存切出的连续 4KB 块」打包，src/dst 地址连续；但 snapshot 的真实页是**物理散落**的（虚拟连续、物理不连续）。DSA batch 描述符每个子操作本就是独立 src→dst 区间，理论上支持任意地址，但**尚未实测散落页打包是否仍拿 5~11×**——这是 Data Stream Offload 的物理前提。
+2. **页温度决定 5~11× 的适用条件**：阶段 3 的 5~11× 建立「冷拷贝基线 8.55 GB/s」（16MB 超出 cache）之上；若 snapshot 的页是仍在 cache 的「热页」，CPU 基线更高（单发 4KB 热基线达 63.4 GB/s），DSA 反超幅度会缩水。需测真实 snapshot 场景的页温度，确定反超倍数的可信范围。
+
+**分步：**
+
+| 步 | 做什么 | 产出 |
+|---|---|---|
+| 4.1 场景建模 | 写 snapshot 微负载 benchmark：散落页 batch + 冷/热页 CPU 基线 | 回答上面两个遗留问题 |
+| 4.2 搬运占比 | 在 Firecracker 跑典型负载，perf/插桩测 mem2mem 占 VMM vCPU 总负载比例 | 搬运占比数值 |
+| 4.3 FFI PoC | Rust 调 `dml_submit_job` 提交一个 DSA 作业并等完成 | 证明 Rust→DSA 链路通 |
+| 4.4 接入端到端 | 选 1~2 条热路径接 DSA，A/B 对比 checkpoint/resume | 端到端收益数据 |
+
 ## 五、脚本清单
 
 > 各阶段实测结果留痕见 [results/](results/README.md)，本文档只保留结论摘要与指针。
@@ -167,4 +185,5 @@ sudo accel-config disable-device dsa2
 - ✅ 阶段 1 完成（DSA 已启用，`/dev/dsa` 节点生成）。
 - 🔄 阶段 2 进行中：memcpy/fill 吞吐对比已出（盈亏平衡 ~1MB，见上文）；compare/delta/CRC 待测。
 - ✅ 阶段 3 完成：真异步释放 89.76% + 4KB Batch（N≥48 反超 CPU 5~11 倍），见上文。
-- ⏸ 阶段 4-5 待推进。
+- 📋 阶段 4 规划中：散落页 batch + 页温度（场景建模 4.1）、搬运占比（4.2）、Rust FFI PoC（4.3）、端到端接入（4.4），见上文。
+- ⏸ 阶段 5 待推进。
