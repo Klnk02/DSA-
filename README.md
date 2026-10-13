@@ -1,14 +1,14 @@
 # DSA-：Intel DSA 对沙箱的影响性探索
 
-> 目标：以 Intel DSA 为参照，量化「数据搬移/内存操作硬件卸载」对沙箱（Firecracker microVM）关键路径的实际收益，作为评估「鲲鹏（ARM）是否需要实现 DSA 等价功能」的决策依据。
+> 目标：以 Intel DSA 为参照，量化「数据搬移（mem2mem / disk↔mem）硬件卸载」对沙箱（Firecracker microVM）关键路径的实际收益，作为评估「鲲鹏（ARM）是否需要实现 DSA 等价功能」的决策依据。
 
 > 本文档与仓库内脚本同步维护，脚本变更时需一并更新对应章节。
 
 ## 〇、背景与定位
 
-- **终极问题**：鲲鹏（Kunpeng/ARM）目前**没有** Intel DSA 这类「内存操作卸载引擎」（memcpy/memfill/compare/delta/CRC 的硬件加速）。要不要补这个能力？补哪些操作？
+- **终极问题**：鲲鹏（Kunpeng/ARM）目前**没有** Intel DSA 这类「内存操作卸载引擎」（memcpy/memfill/compare/delta/CRC 的硬件加速）。要不要补这个能力？补哪些操作？——本项目聚焦其中的**数据搬运**（memcpy，即 mem2mem / disk↔mem 卸载）。
 - **本项目做法**：在 Intel Sapphire Rapids（8480+）机器上实测 DSA 的加速收益，把 DSA 当作「价值标尺」，量化它到底值多少。
-- **边界澄清**：鲲鹏 KAE 已具备**加解密 + zlib/gzip 压缩**加速，故压缩不是缺口；本项目聚焦 DSA **独有的**数据搬移/内存操作能力。
+- **边界澄清**：鲲鹏 KAE 已具备**加解密 + zlib/gzip 压缩**加速，故压缩不是缺口；本项目聚焦 DSA **独有的数据搬移**能力（mem2mem / disk↔mem 卸载），memfill/compare/delta/CRC 不在研究范围。
 - **交付形态**：价值评估报告 + **软件替代分析**（鲲鹏 NEON/SVE 软件能补上多少，作为「要不要造硬件」的必要对照）。
 
 ## 一、贯穿全程的三个核心判断
@@ -17,7 +17,7 @@
 
 2. **沙箱值钱的是「并发」和「批处理」，不是单发**。沙箱平台是成千上万 VM，单进程测单次提交的极限吞吐意义有限。真正贴近沙箱的是 shared 队列 + ENQCMD 的并发共享，以及把海量 4KB 页操作打包成 DSA 的 Batch 描述符。
 
-3. **压缩不是本次重点**。DSA 本身不含压缩（压缩在 IAA/QAT），而鲲鹏 KAE 已能做压缩；沙箱内存层压缩用 LZ4/zstd，也与 IAA 的 Deflate 对不上。故本项目聚焦 DSA 独有的「数据搬移/填零/比较/差异/CRC」，压缩留作旁支。
+3. **压缩不是本次重点**。DSA 本身不含压缩（压缩在 IAA/QAT），而鲲鹏 KAE 已能做压缩；沙箱内存层压缩用 LZ4/zstd，也与 IAA 的 Deflate 对不上。故本项目聚焦 DSA 独有的「数据搬移」（mem2mem / disk↔mem 卸载），memfill/compare/delta/CRC 与压缩一并留作旁支、不在研究范围。
 
 ## 二、目标机环境基线（已探测）
 
@@ -39,17 +39,17 @@
 |---|---|---|---|
 | 0 环境探测 ✅ | 摸清 DSA/IAA/驱动/工具链 | `check_dsa_env.sh` + 结果 | 硬件在不在、能不能用 |
 | 1 启用配置 ✅ | 启用 DSA、配 dedicated+shared 队列 | `setup_dsa.sh` | 把 DSA 变成可调用状态 |
-| 2 核心基准 | DSA vs CPU 逐操作对比 | 加速比矩阵 | 每个操作、多大尺寸才划算 |
+| 2 核心基准 | DSA vs CPU 数据搬运（memcpy）对比 | 加速比矩阵 | memcpy 多大尺寸才划算 |
 | 3 场景建模 | 把沙箱热点抽象成 DSA 微负载 | 贴近沙箱的 benchmark | 沙箱典型负载 DSA 有没有戏 |
 | 4 沙箱集成 | 把 DSA 接进 Firecracker 1-2 条热路径 | 接入 DSA 的沙箱 + 端到端数据 | checkpoint/resume 实际快了没 |
 | 5 结论报告 | 汇总 + 软件替代分析 | 报告 + 建议 | 鲲鹏要不要做等价功能、软件能补多少、优先做哪些操作 |
 
 ### 阶段 2 基准维度（核心）
 
-- **操作**：memcpy、memfill、compare、delta（差异）、CRC32C、Dualcast。
+- **操作**：本项目聚焦 **memcpy（数据搬运，mem2mem / disk↔mem）**。memfill、compare、delta、CRC32C、Dualcast 为 DSA 能力全集，不在本项目研究范围。
 - **对比轴**：吞吐（GB/s）、延迟（us）、CPU 占用率、批量大小、dedicated vs shared。
 - **关键输出**：一张「操作 × 模式 × 尺寸 → 加速比」矩阵 + 盈亏平衡点。
-- **双用途**：这组 CPU baseline 同时是「软件替代分析」的参照——ARM 上这些操作只能用 NEON/SVE 软件做，需用同样 benchmark 在鲲鹏上跑出软件基线，与 DSA 硬件值对比，得出「软件能补多少、硬件还有多少额外价值」。
+- **双用途**：这组 CPU baseline 同时是「软件替代分析」的参照——ARM 上数据搬运（memcpy）只能用 NEON/SVE 软件做，需用同样 benchmark 在鲲鹏上跑出软件基线，与 DSA 硬件值对比，得出「软件能补多少、硬件还有多少额外价值」。
 
 ### 阶段 2 初步实测（memcpy/fill，2026-10-12）
 
@@ -100,11 +100,16 @@
 
 | 沙箱环节 | 底层操作 | DSA 能力 |
 |---|---|---|
-| 快照生成「ExportToDiff 拷数据」 | 拷贝 + 差异 | memcpy + delta |
-| CoW / dirty page 检测 | 比较 + 差异 | compare + delta |
-| guest 内存初始化 / zeropage | 填零 | memfill |
-| 快照恢复（磁盘→内存） | 拷贝 | memcpy |
-| 零拷贝 / Direct I/O 搬移 | 拷贝 | memcpy |
+| 快照生成「ExportToDiff 拷数据」 | 拷贝（mem2mem） | memcpy |
+| 快照恢复（磁盘→内存） | 拷贝（disk→mem） | memcpy |
+| 零拷贝 / Direct I/O 搬移 | 拷贝（mem2mem） | memcpy |
+
+> 以下为「已识别但不在本研究范围」的接入点（涉及 memfill/compare/delta，本次范围排除）：
+>
+> | 沙箱环节 | 底层操作 | DSA 能力 |
+> |---|---|---|
+> | CoW / dirty page 检测 | 比较 + 差异 | compare + delta |
+> | guest 内存初始化 / zeropage | 填零 | memfill |
 
 ### 阶段 4 规划（沙箱集成）
 
@@ -244,7 +249,7 @@ sudo accel-config disable-device dsa2
 
 - ✅ 阶段 0 完成（探测 + 结论已沉淀到本文档）。
 - ✅ 阶段 1 完成（DSA 已启用，`/dev/dsa` 节点生成）。
-- 🔄 阶段 2 进行中：memcpy/fill 吞吐对比已出（盈亏平衡 ~1MB，见上文）；compare/delta/CRC 待测。
+- ✅ 阶段 2 完成（数据搬运部分）：memcpy 吞吐对比已出（盈亏平衡 ~1MB，见上文）；fill/compare/delta/CRC 不在研究范围，已排除。
 - ✅ 阶段 3 完成：真异步释放 89.76% + 4KB Batch（N≥48 反超 CPU 5~11 倍），见上文。
 - ✅ 阶段 4.1 完成：散落页 batch 物理前提成立 + 页温度（5~11× 仅冷页成立），见上文。
 - ✅ 阶段 4.2 完成：AgentENV snapshot 搬运路径坐实（`process_vm_readv` + `pwrite`，942ms/GB）；DSA 卸载 4KB 页有正收益（busy-poll +78.4%，「负收益」是 usleep 假象）；异步等待已源码查证（AgentENV 同步搬运 + io_uring 可用），见上文。
