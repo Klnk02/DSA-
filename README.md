@@ -135,6 +135,56 @@
 - **5~11× 只在冷页成立**：热页 CPU 靠 cache（38.57 GB/s，热/冷比 4.18×），DSA 反超缩水到 1~2.5×（仍正收益）。snapshot 实际收益取决于页温度分布。
 - **异常待留意**：N=32 散落（11.88 GB/s）反比连续（4.50）快 2.64×，发生在负收益区不影响结论；N=64 散落单点波动大（38.8~54.3）。
 
+**4.2 搬运占比初步实测**（2026-10-12，AgentENV snapshot 的 memory 搬运链路，数据见 [results/stage4-sandbox/snapshot_offload.csv](results/stage4-sandbox/snapshot_offload.csv)）：
+
+> 对象：kvcache-ai 开源的 AgentENV（Firecracker 沙箱平台，Kimi K3 训练用）。本步回答「snapshot 里 mem2mem 搬运到底占多少 CPU、走哪条路径」。
+
+**机制（源码级确认）**：AgentENV snapshot 是「KVM dirty page tracking **增量快照**」，非全量 memcpy。搬运链路：orchestrator（`server` 进程，`tokio-rt-worker` 线程）用 `process_vm_readv` 从 firecracker 进程读 dirty 匿名内存 → `pwrite` 写入 OverlayBD commit 文件（ext4）。
+
+**搬运 CPU 量化（5 次取平均）**：
+
+| 指标 | 值 |
+|---|---|
+| pause 固定开销（0MB dirty） | 53.32 ms |
+| pause 256MB dirty | 288.94 ms |
+| 纯搬运（256MB） | 235.62 ms |
+| **搬运 CPU 成本** | **942 ms/GB**（对比：CPU memcpy 82.9、DSA 异步 8.5） |
+
+**搬运链路符号构成（perf 采样 orchestrator + ublk，只包 pause）**：
+
+| 符号 | 占比 | 属性 |
+|---|---|---|
+| ext4 文件系统逻辑（`ext4_da_write_begin`/`block_write_begin`/`write_end`） | ~55% | 持久化簿记，非数据搬运 |
+| `copy_page_to_iter`（`process_vm_readv` 的跨进程拷贝） | 10.18% | **数据搬运** |
+| `copy_page_from_iter_atomic`（写 page cache 拷贝） | 2.46% | **数据搬运** |
+| 页表遍历 + 元数据 + 状态机 | ~32% | 逻辑 |
+
+**关键口径修正（踩坑）**：
+
+- ❌ 曾误判「snapshot 无 CPU 搬运」：根因有二——(1) 早期用 `dd 写文件`制造 dirty，测到的是 overlaybd 文件系统 CoW，不是内存 snapshot；(2) perf 只采 `firecracker` 进程，漏掉真正搬数据的 orchestrator（`server`）进程。
+- ✅ 准确表述：**显式 `memcpy` 符号占比 ≈ 0，但搬运路径真实存在**——现代 x86 数据搬运用 `rep movsb`（ERMS）这类硬件字符串指令，perf 符号树显示的是其上层封装 `copy_page_to_iter`/`copy_page_from_iter_atomic`/`copy_user`，而非符号 `memcpy`。
+- ⚠️ 显性 copy 指令 ~12.6% 之外，**搬运仍有隐性成本（cache 污染、内存带宽争用）**：`rep movsb` 把冷数据拉进 cache 会拖慢 ext4 那 ~55% 的逻辑。这部分次生收益无法靠符号占比静态算，只能实测 DSA 卸载后的整体 CPU 下降。
+
+**4.2 补充：DSA 卸载 memory copy 的 CPU 下降比例**（`dsa_snapshot_offload.c`，模拟「散落 dirty 页 → 连续 target」的 snapshot 搬运形态）：
+
+| 配置 | DSA batch 每 GB CPU | vs CPU memcpy（112.7ms/GB） |
+|---|---|---|
+| 4KB + usleep 异步 | 155 ms/GB | -37%（假象） |
+| 4KB + busy-poll | 24.4 ms/GB | **+78.4%** |
+| 64KB + usleep 异步 | 9.4 ms/GB | +91% |
+
+- **描述符构建其实很便宜**（~100ns/页 < memcpy 467ns/页），DSA 卸载 4KB 页本身有正收益：busy-poll 下 CPU 时间下降 78.4%。
+- **「4KB 负收益」是 usleep 异步等待的假象**：`usleep` 每次 ~25µs 系统调用开销 × 682 批 ≈ 130ms/GB，把收益吃光；去掉 usleep 改 busy-poll 后立即翻正（-37% → +78.4%），已用对照实验坐实。
+- 阶段 3 的「batch 反超」与本次一致：都是无 usleep 的 busy-poll 口径（阶段 3 用 `dml_execute_job(BUSY_POLL)`）。
+
+**异步等待的源码查证（AgentENV）**：
+
+- AgentENV 的「搬运」本身是**同步**的：capture 阶段用 `process_vm_readv`（同步 syscall）阻塞等内核 copy 完成，**无异步等待逻辑**。
+- 异步在另两个层面：写 commit 文件走 `io_uring`（`AsyncIoRing`），resume 走 `MAP_PRIVATE` + CoW 懒缺页（官方架构文档）。
+- **对 DSA 的意义**：AgentENV 现状是同步 memcpy，本无异步等待问题；只有接 DSA 才引入「等待 DSA 完成」的抉择。而 AgentENV 已有成熟 io_uring 基础设施，若接 DSA 可用 io_uring/eventfd 等高效等待替代 usleep，避开 usleep 陷阱。
+
+**修正后的阶段 4.2 结论**：DSA 卸载 4KB 页搬运有真实正收益（busy-poll 78.4%）；「负收益」是 usleep 假象，非 DSA 能力边界；真正开放的问题是「异步释放 CPU 需高效等待」，AgentENV 的 io_uring 可支撑。→ 转入 4.3/4.4 评估。
+
 ## 五、脚本清单
 
 > 各阶段实测结果留痕见 [results/](results/README.md)，本文档只保留结论摘要与指针。
@@ -197,5 +247,6 @@ sudo accel-config disable-device dsa2
 - 🔄 阶段 2 进行中：memcpy/fill 吞吐对比已出（盈亏平衡 ~1MB，见上文）；compare/delta/CRC 待测。
 - ✅ 阶段 3 完成：真异步释放 89.76% + 4KB Batch（N≥48 反超 CPU 5~11 倍），见上文。
 - ✅ 阶段 4.1 完成：散落页 batch 物理前提成立 + 页温度（5~11× 仅冷页成立），见上文。
-- 📋 阶段 4.2-4.4 待推进：搬运占比（4.2）、Rust FFI PoC（4.3）、端到端接入（4.4）。
+- ✅ 阶段 4.2 完成：AgentENV snapshot 搬运路径坐实（`process_vm_readv` + `pwrite`，942ms/GB）；DSA 卸载 4KB 页有正收益（busy-poll +78.4%，「负收益」是 usleep 假象）；异步等待已源码查证（AgentENV 同步搬运 + io_uring 可用），见上文。
+- 📋 阶段 4.3-4.4 待推进：Rust FFI PoC（4.3）、端到端接入（4.4，含 io_uring 高效异步等待）。
 - ⏸ 阶段 5 待推进。
