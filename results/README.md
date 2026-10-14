@@ -22,3 +22,4 @@
 - `stage3-batch/batch_4k.csv` — `dsa_batch_4k.c` 实测的 4KB 页操作 Batch 打包吞吐（存在尖锐批量效率阈值 N≈48，N≥48 反超 CPU 5~11 倍）。
 - `stage4-scene/scene_4k.csv` — `dsa_scene_4k.c` 实测（散落页 batch 物理前提成立；页温度决定 5~11× 仅在冷页成立，热页缩水到 1~2.5×）。
 - `stage4-sandbox/snapshot_offload.csv` — AgentENV snapshot memory 搬运路径实测（搬运 CPU 942ms/GB；链路 = `process_vm_readv` 读 guest dirty 页 → `pwrite` 写 OverlayBD commit 文件；符号构成：ext4 簿记 ~55% / copy_page_to_iter 10.18% / copy_page_from_iter_atomic 2.46%；DSA 卸载 CPU 下降：4KB busy-poll +78.4%、64KB +91%、4KB usleep 是假象）。
+- `stage4-sandbox/baseline_sweep.csv` — A 臂基线扫描原始输出（2026-10-14，0/64/256MB × repeat=20，1024/2048 待补；统计口径：剔除 perf record 的 rep 1/8/15（profiling 使 wall +2.2s）与 64MB rep4（漏 dirty），结论见主 README 4.4）。

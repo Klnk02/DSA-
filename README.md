@@ -83,7 +83,7 @@
 
 - **`dml_submit_job` 是真异步**：提交后 CPU 立即返回、不 busy-poll。异步 + 让出 CPU 后，搬运占用的 CPU 时间从 82.9ms/GB 降到 8.5ms/GB，**释放率 89.76%**。
 - **umwait 只省电不释放**：CPU 仍被占用（占用率 ~100%），真释放靠「让出 CPU」而非低功耗等待。
-- **换算到目标**：vCPU 可用资源提升 = 搬运占比 × 89.76%。若搬运占 vCPU 总负载 6%~11%，则提升 ≈ 5%~10%（搬运占比待阶段 4 实测）。
+- **换算到目标**：vCPU 可用资源提升 = 搬运占比 × 89.76%。若搬运占 vCPU 总负载 6%~11%，则提升 ≈ 5%~10%（搬运占比待阶段 4 实测）。**（2026-10-14 口径修正）**此推导过于乐观：89.76% 是 mem2mem 纯拷贝的释放率，真实链路里 DSA 只够得着搬运 CPU 的一部分，修正公式与达标条件见 4.4。
 
 **4KB 页操作 Batch 打包**（冷数据，16MB 连续 4KB 块，`dsa_batch_4k.c`，数据见 [results/stage3-batch/batch_4k.csv](results/stage3-batch/batch_4k.csv)；阈值经加密采样 N=48/56/72/96 + 每组 3 次重复复测，2026-10-12）：
 
@@ -190,6 +190,39 @@
 
 **修正后的阶段 4.2 结论**：DSA 卸载 4KB 页搬运有真实正收益（busy-poll 78.4%）；「负收益」是 usleep 假象，非 DSA 能力边界；真正开放的问题是「异步释放 CPU 需高效等待」，AgentENV 的 io_uring 可支撑。→ 转入 4.3/4.4 评估。
 
+**4.4 A 臂基线初步实测**（2026-10-14，[baseline_pause_sweep.sh](baseline_pause_sweep.sh)，真实 AgentENV sandbox（整轮复用 1 个），repeat=20/档；0/64/256MB 已测、1024/2048 待补；原始数据见 [results/stage4-sandbox/baseline_sweep.csv](results/stage4-sandbox/baseline_sweep.csv)）：
+
+> 方法与 4.2 对齐：`aenv pause` 触发、guest 内 `dd` 写 `/dev/shm` 制造 dirty；wall = `aenv pause` 命令耗时（含 CLI 往返，A/B 同口径）；CPU = `perf stat task-clock` 包住 orchestrator(server)。统计剔除 perf record 的 rep 1/8/15（profiling 使 wall +2.2s）与 64MB rep4（漏 dirty）。
+
+| dirty | pause wall | server CPU（task-clock） |
+|---|---|---|
+| 0 MB | 169.6 ± 4 ms | ≈ 0 |
+| 64 MB | 1170.8 ± 12 ms | 22.4 ms（噪声大：4.7~30） |
+| 256 MB | 1163.6 ± 20 ms | 168.5 ± 22 ms |
+
+- **发现 1 · pause wall 含 ~1s 与 dirty 量无关的固定等待**：64 与 256MB 的 wall 相同（sd 仅 1~2%，定时器级确定性），0MB 仅 170ms；期间 server CPU≈0（64MB 档 1s 窗口内仅 ~22ms、0MB 档 = 0）→ 推测为阻塞等待。**与 DSA 解耦、另线定位**（strace 待做）。含义：只减 CPU 的优化（含 DSA）预计不改变 pause 时长；推测 dirty ≳1GB（搬运时间超过固定等待）后 wall 才随 dirty 增长，待 1024/2048 档验证。
+- **发现 2 · CPU 随 dirty 线性增长**：256MB 档折算 ≈ **674 ms/GB**（4.2 在另一沙箱测得 942——同量级、两次独立测量互为印证；不跨沙箱混比，A/B 臂内对比为准）。memory copy 子路径是 DSA 的直接优化对象，端到端收益受 filesystem/control-plane 占比限制。
+- **发现 3 · 0MB 固定 CPU 开销 ≈ 0**：4.2 的 53.32ms 未复现（沙箱状态相关），本环境纯搬运 ≈ taskclk 全额。
+
+**目标口径修正（承阶段 3「换算到目标」）**：
+
+```
+vCPU 可用资源提升 = 搬运占 vCPU 总负载 × DSA 可卸载占搬运 CPU 的比例
+                                       ├ 保守 ~12%：仅拷贝符号（674 × 12.6% ≈ 85 ms/GB → 异步 DSA ~8 ms）
+                                       └ 乐观 ~25%：memfd 连跨进程页表遍历一起省 + cache 污染消失（B 臂实测钉死）
+```
+
+| 搬运占 vCPU 总负载 | 可卸载 12%（保守） | 可卸载 25%（乐观） |
+|---|---|---|
+| 5% | 0.6% | 1.3% |
+| 10% | 1.2% | 2.5% |
+| 20% | 2.4% | 5.0% |
+| 40% | 4.8% | 10.0% |
+
+- **5~10% 目标需要「重快照节奏（搬运占比 20~40%）+ 乐观可卸载」同时成立**——一半取决于生产参数（快照周期 × 每次 dirty 量 × 沙箱密度），待确认。直观换算：搬运占 10% 总负载 ≈ 8480+ 上 ~33 GB/s 整机快照流量（1000 沙箱 × 1GB/30s 量级）。
+- **B 臂任务重述**：把可卸载比例从 12~25% 区间钉成实测值（直接决定 5~10% 能否够着）；预期 pause CPU 降 9~25%、wall 持平（被 1s 等待掩盖）。
+- **写盘段是更大的 CPU 杠杆**：ext4 ~55% ≈ 371 ms/GB vs 拷贝符号 ~85 ms/GB → C 臂（O_DIRECT）与 B 臂并排跑，归因分开。
+
 ## 五、脚本清单
 
 > 各阶段实测结果留痕见 [results/](results/README.md)，本文档只保留结论摘要与指针。
@@ -219,6 +252,13 @@ sudo accel-config disable-wq     dsa2/wq2.1
 sudo accel-config disable-device dsa0
 sudo accel-config disable-device dsa2
 ```
+
+### [baseline_pause_sweep.sh](baseline_pause_sweep.sh) — 阶段 4.4 · A 臂基线扫描
+
+- **性质**：零代码改动，纯测量（真实 AgentENV snapshot pause），方法与 4.2 对齐（`aenv pause` + `perf stat task-clock` 包住窗口，orchestrator 进程名 `server`）。
+- **内容**：整轮复用一个沙箱（pause → resume → 重打 dirty 循环，TTL 拉长到 12h）；dirty 量扫描（默认 0/64/256/1024/2048 MB，0 为固定开销对照组）× repeat（默认 20）；guest 内 `dd` 写 `/dev/shm` 制造 dirty；每档抽样 `perf record`（server + uvm-ublk-daemon）留符号构成。
+- **用法**：`TEMPLATE=<模板名> bash baseline_pause_sweep.sh`；短版 `REPEAT=3`；OCI 镜像 `COLD=1 CPU_COUNT=4 MEM_MIB=8192`（guest 内存 ≥ 最大 dirty 档 ×1.5）；跑完删沙箱 `CLEANUP=1`。输出 `results/stage4-sandbox/baseline_sweep*.csv` + `perf/`。
+- **口径**：wall = `aenv pause` 命令耗时（含 CLI 往返，A/B 同口径）；CPU = orchestrator(server) 的 task-clock（对照 4.2 的 942 ms/GB）；dirty 只写 guest tmpfs，禁止写盘（overlaybd CoW 坑）。汇总自动剔除 `perfrec` 行（profiling 使 wall +2.2s）并打印「疑似漏 dirty」告警（dirty>0 但 taskclk≈0）。
 
 ### [dsa_bench.cc](dsa_bench.cc) — DSA vs CPU 基准测试（阶段 2）
 
@@ -253,5 +293,5 @@ sudo accel-config disable-device dsa2
 - ✅ 阶段 3 完成：真异步释放 89.76% + 4KB Batch（N≥48 反超 CPU 5~11 倍），见上文。
 - ✅ 阶段 4.1 完成：散落页 batch 物理前提成立 + 页温度（5~11× 仅冷页成立），见上文。
 - ✅ 阶段 4.2 完成：AgentENV snapshot 搬运路径坐实（`process_vm_readv` + `pwrite`，942ms/GB）；DSA 卸载 4KB 页有正收益（busy-poll +78.4%，「负收益」是 usleep 假象）；异步等待已源码查证（AgentENV 同步搬运 + io_uring 可用），见上文。
-- 📋 阶段 4.3-4.4 待推进：Rust FFI PoC（4.3）、端到端接入（4.4，含 io_uring 高效异步等待）。
+- 🚧 阶段 4.4 进行中：A 臂基线 0/64/256MB 已测（wall 含 ~1s 固定等待、CPU ≈ 674 ms/GB、目标口径已修正，见 4.4；1024/2048 待补）。待推进：Rust FFI PoC（4.3）、B/C 臂接入与 A/B 对比（4.4）。
 - ⏸ 阶段 5 待推进。
