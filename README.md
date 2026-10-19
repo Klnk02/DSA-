@@ -1,5 +1,7 @@
 # DSA-：Intel DSA 对沙箱的影响性探索
 
+> **当前入口（2026-10-19修订）**：[当前结论、证据边界与下一步](CURRENT_STATUS.md)。下文保留实验演进，标为历史的章节不用于当前定量结论；真实 snapshot DSA 端到端 A/B 尚未完成，已有报告二进制按历史快照保留。
+
 > 目标：以 Intel DSA 为参照，量化「数据搬移（mem2mem / disk↔mem）硬件卸载」对沙箱（Firecracker microVM）关键路径的实际收益，作为评估「鲲鹏（ARM）是否需要实现 DSA 等价功能」的决策依据。
 
 > 本文档与仓库内脚本同步维护，脚本变更时需一并更新对应章节。
@@ -104,6 +106,11 @@
 | 快照恢复（磁盘→内存） | 拷贝（disk→mem） | memcpy |
 | 零拷贝 / Direct I/O 搬移 | 拷贝（mem2mem） | memcpy |
 
+> ⚠️ 口径限定（2026-10-19 复核，见 [qa.md](qa.md) Q9/Q10）：上表是**能力**对照，不等于**现状可介入**。
+> 现状 snapshot 的两个方向（mem2disk：`process_vm_readv`+`pwrite`；disk2mem：ublk/overlaybd 读 + 恢复缺页）
+> 数据搬运全在**内核**里完成，DSA 只能搬提交者本进程地址空间内的内存 ⇒ 结构上无法介入，
+> 「快照恢复（磁盘→内存）= memcpy」在现状路径上**不成立**（详见 §4.2 源码级链路）。
+
 > 以下为「已识别但不在本研究范围」的接入点（涉及 memfill/compare/delta，本次范围排除）：
 >
 > | 沙箱环节 | 底层操作 | DSA 能力 |
@@ -140,7 +147,7 @@
 - **5~11× 只在冷页成立**：热页 CPU 靠 cache（38.57 GB/s，热/冷比 4.18×），DSA 反超缩水到 1~2.5×（仍正收益）。snapshot 实际收益取决于页温度分布。
 - **异常待留意**：N=32 散落（11.88 GB/s）反比连续（4.50）快 2.64×，发生在负收益区不影响结论；N=64 散落单点波动大（38.8~54.3）。
 
-**4.2 搬运占比初步实测**（2026-10-12，AgentENV snapshot 的 memory 搬运链路，数据见 [results/stage4-sandbox/snapshot_offload.csv](results/stage4-sandbox/snapshot_offload.csv)）：
+**4.2 搬运占比初步实测【历史：真实路径数据受污染，勿引用其942与ext4约55%】**（2026-10-12，AgentENV snapshot 的 memory 搬运链路，数据见 [results/stage4-sandbox/snapshot_offload.csv](results/stage4-sandbox/snapshot_offload.csv)）：
 
 > 对象：kvcache-ai 开源的 AgentENV（Firecracker 沙箱平台，Kimi K3 训练用）。本步回答「snapshot 里 mem2mem 搬运到底占多少 CPU、走哪条路径」。
 
@@ -190,7 +197,18 @@
 
 **修正后的阶段 4.2 结论**：DSA 卸载 4KB 页搬运有真实正收益（busy-poll 78.4%）；「负收益」是 usleep 假象，非 DSA 能力边界；真正开放的问题是「异步释放 CPU 需高效等待」，AgentENV 的 io_uring 可支撑。→ 转入 4.3/4.4 评估。
 
-**4.4 A 臂基线初步实测**（2026-10-14，[baseline_pause_sweep.sh](baseline_pause_sweep.sh)，真实 AgentENV sandbox（整轮复用 1 个），repeat=20/档；0/64/256MB 已测、1024/2048 待补；原始数据见 [results/stage4-sandbox/baseline_sweep.csv](results/stage4-sandbox/baseline_sweep.csv)）：
+**4.3 干净全量定稿 + 模拟推断（2026-10-19，磁盘清理后重跑；[measure_copy_share.sh](measure_copy_share.sh) + [dsa_disk_scene.c](dsa_disk_scene.c)）**：
+
+> 4.2 的 942 ms/GB 与「ext4 簿记 ~55%」是**磁盘满污染轮**数据（失败事件重试路径烧 ~4 倍 CPU：污染轮 5651 样本/事件 vs 干净轮 1450），以下为干净轮定稿口径：
+> - **A 段（分母锚点）**：pause task-clock 差分回归 = **516 ± 74 ms/GiB + 固定 108.3 ms**（0/64/256/1024MB × 20 轮，R²=0.708，0/80 失败）。
+> - **B 段（构成）**：perf -F4000 包 60 成功事件，87024 样本，符号 100% 解析——搬运段 = 读侧 `_copy_to_iter`（process_vm_readv 跨进程）**11.66%** + 写侧 `copy_page_from_iter_atomic`（pwrite）**2.20%** = **13.85%**（Wilson 95%CI [13.64, 14.07]）= 71.5 ms/GiB，单项最大已识别头；其余 = page cache/XArray 10.65% / memcg/LRU 8.24% / 页表 4.65% / 锁/RCU 3.37% / 长尾 57.8%。
+> - **dsa_disk_scene 公平三结构**（60MB×15 冷页，`both` 方向，跨源对账 11 臂全 OK）：mem2disk Δ = 408.7 − 365.5 = **43.2 ms/GiB** → **推断比 = 43.2/516 = 8.4%**；disk2mem Δ = 423.6 − 387.4 = **36.2** → ≈**7.0%**（对称假设分母，待 MODE=resume 实测修正）。交叉验证：参照臂省比例 54.5%（85.0→38.7）× 真实搬运段 71.5 = 38.9/516 = 7.5%，同量级。
+> - **净收益判据**：本轮60MiB微基准中，DSA新增staging两步相对软件一步，onCPU增加 **10.4% / 10.7%**。这支持该条件下新增搬运不划算；7%～8%仅为条件外推，不能表述为snapshot收益的严格上限。
+> - 图：[report/figures/fig7_pause构成.png](report/figures/fig7_pause构成.png)；表：[results/stage4-sandbox/disk_scene_60mb_v6.xlsx](results/stage4-sandbox/disk_scene_60mb_v6.xlsx)（Sheet1 方案对比主表 + 推断比结论，Sheet2 详细 11 臂）。
+
+> **4.3引用限制**：以上为已有汇总记录，原始copy_share与disk_scene日志本地待补归档。516是数据量相关整体CPU斜率；13.85%是另测窗口的copy符号占比；71.5是两者乘积而非独立实测。Wilson区间仅为样本计数近似，未涵盖事件间相关与分类误差。sw_1step是微基准read/write，非完整snapshot；disk2mem真实分母待测。
+
+**4.4 A 臂基线初步实测【历史停用：674、近零固定项与下列收益情景不作为当前依据】**（2026-10-14，[baseline_pause_sweep.sh](baseline_pause_sweep.sh)，真实 AgentENV sandbox（整轮复用 1 个），repeat=20/档；0/64/256MB 已测、1024/2048 待补；原始数据见 [results/stage4-sandbox/baseline_sweep.csv](results/stage4-sandbox/baseline_sweep.csv)）：
 
 > 方法与 4.2 对齐：`aenv pause` 触发、guest 内 `dd` 写 `/dev/shm` 制造 dirty；wall = `aenv pause` 命令耗时（含 CLI 往返，A/B 同口径）；CPU = `perf stat task-clock` 包住 orchestrator(server)。统计剔除 perf record 的 rep 1/8/15（profiling 使 wall +2.2s）与 64MB rep4（漏 dirty）。
 
@@ -223,7 +241,84 @@ vCPU 可用资源提升 = 搬运占 vCPU 总负载 × DSA 可卸载占搬运 CPU
 - **B 臂任务重述**：把可卸载比例从 12~25% 区间钉成实测值（直接决定 5~10% 能否够着）；预期 pause CPU 降 9~25%、wall 持平（被 1s 等待掩盖）。
 - **写盘段是更大的 CPU 杠杆**：ext4 ~55% ≈ 371 ms/GB vs 拷贝符号 ~85 ms/GB → C 臂（O_DIRECT）与 B 臂并排跑，归因分开。
 
+### 阶段 4.5 · 透明插桩验证（leader 确认方向：不改 AgentENV 源码）
+
+> **方案状态修订**：下列为历史方案设计，非全部已验证成果。anon/nonce的mmap/DSA臂从本地预取缓冲搬运，预取在计时窗外，checksum不保证跨臂guest内容一致；GET_DIRTY_LOG的副作用取决于目标模式，只GET不CLEAR不能保证零扰动。当前排序以[验证计划](CURRENT_STATUS.md)为准，先归档与修复观测失败处理、补resume分母，再评估专用实例回放；旧12%～25%预期及C1等效负载数值停用。
+
+> 立项依据：A 臂基线已锚定真实链路成本（4.4）；leader 指示下一步不改 AgentENV 源码，全部通过 eBPF / procfs / pidfd / 运行态回放等**透明手段**验证。4.3（Rust FFI PoC）与 4.4（feature flag 三臂）后移，待本阶段出数后再启动。
+> 表述纪律（延续评审反馈）：现象 → 观察；因果 → 推测；占比 → 标注口径（进程/系统）；能力边界 → 覆盖范围。实验现象不过度解释成机制结论，数据不夸大。
+
+**跟踪线 A · 观测与口径闭合（小活，一次服务器行程带完）**
+
+| 编号 | 做什么 | 工具 | 回答的问题 |
+|---|---|---|---|
+| A1 | pause 窗口按 syscall/符号归因：process_vm_readv / vfs_write / fsync 的耗时与字节数；copy_page_to_iter / copy_page_from_iter_atomic 精确计时 | [bpftrace_pause_attribution.bt](bpftrace_pause_attribution.bt) | 真实 pause 里 memory copy 子路径精确占多少（含 iovec 分布，为 batch 参数输入） |
+| A2 | 全机 CPU 口径标定：/proc/stat 差分（user+nice+sys+irq+softirq+steal）vs 进程 task-clock，残差 ≈ kworker 回写 + jbd2 + irq（推测级） | [calibrate_cpu_scope.sh](calibrate_cpu_scope.sh) | copy 占比 26~32% 是进程口径上界，系统口径修正值是多少（4.4 遗留的严谨性问题） |
+| A3 | ~1s 固定等待定位：calibrate pause 模式 `PERFREC=1`（perf record -a 看窗口内全机谁在干活）+ `strace -f -p $(pgrep -x server)` 看 fsync/futex/nanosleep | 同上 + strace | 1s 等待在等谁（4.4 发现 1 遗留） |
+
+**跟踪线 B · 运行态回放（核心 = B 臂的体外预演）**
+
+原理：运行态（pause 之前）guest 已制脏完、随即 idle，firecracker 的 guest RAM 就是 rw-p 的 COW 私有页（实测 mmap /dev/ublkbN）；pause 会把该 COW 段 flush+unmap（读源消失）——所以三臂回放在运行态做，外部进程重放同一段搬运，测「真实页分布下的 DSA 收益」，零源码改动。
+
+| 编号 | 做什么 | 回答的问题 |
+|---|---|---|
+| B0 | 定位 guest RAM **三路**：路 0 **nonce 内容定位**（guest 每轮制脏前写 16B 随机数 `/dev/shm/.b0nonce`，host 侧全机 fc 进程可读大段内容搜索（运行态 guest RAM 是 rw-p COW 页，可读；pause 会 unmap 掉它）——命中进程即沙箱真身、命中段所在同文件连续段组即 guest RAM。共享服务器多 fc 并存且 patch 版命令行无 uuid 时 find_fc 失效，此为唯一可靠手段；且实测 AgentENV 后端是 mmap `/dev/ublkbN` 拆两段，匿名大小匹配亦失效；**段组 → 线性偏移映射用 foff 升序拼接**（布局约定无关），不再假设 hva 与线性偏移同序——实测段组 foff 逆序排布（低地址段 foff=3GiB），旧线性模型会整体错位 512MiB）；路 1 上游 Firecracker 的 memfd（`pidfd_getfd(2)` 取 fd → mmap 进回放进程只读）；路 2 匿名 mmap 按 slot 大小匹配推断基址。anon/nonce 模式均叠加每轮魔数文件内容级校验（miss 即 NOGO）；nonce 路再叠 **`.b0loc` 位置编码门禁**（guest 写 16 页页首编码 "B0LOC+页号"，probe 对每个 memslot 布局候选做 gpa→线性偏移→hva→内容端到端校验，≥12/16 命中才 GO，全灭 NOGO loc-miss——错位数据宁可失败不出） | RAM 定位路线 go/no-go（B 臂核心前提；B0 行留痕 `ram_src=nonce|memfd|anonmap` + `segs/order/loc/s0`） |
+| B1 | 真实 dirty 页集合：**先读 AgentENV 源码确认 dirty-log 机制（bitmap vs ring、GET 之后是否自动清除）**；运行态经 pidfd_getfd 取得 KVM VM fd，只读 `KVM_GET_DIRTY_LOG` 提取脏页位图（**严禁 KVM_CLEAR_DIRTY_LOG——会破坏 AgentENV 增量快照链**；若 GET 返回空位图则退化为整段 RAM 回放，口径偏保守）。**自检修正**：原设计的 pagemap soft-dirty 是错的——guest 经 EPT 的写入不经过 host 页表，不会置位 soft-dirty。nonce 段组模式位图位→线性偏移换算需知 slot0 字节数 s0，**布局不猜、实测求解**：候选 s0 ∈ {总 RAM（单 slot）/ foff 序累计边界 / hole 边界} ×（匿名组）地址正逆双排列，经 `.b0loc` 内容校验裁定（详见 [qa.md](qa.md)）；每次 GET 前 memset 位图缓冲（KVM 只写该 slot 字数，防跨 slot 残留幻影页） | snapshot 真实脏页分布与页温（补 4.1 热页缩水的工况缺口） |
+| B2 | 同一批页**三路**对比：① `process_vm_readv` 循环（= 现状基线，双模式原生路径）② 直映源 + CPU memcpy（memfd 模式本地 mmap 直映；anon 模式一次性预取进本地缓冲后 memcpy，计时只含搬运）③ 同源 + DML batch（N≥48，复用 `dsa_snapshot_offload.c` 的 batch 描述符），输出 CPU ms/GB | 真实页分布（含热页）下的 mem2mem 收益——可卸载比例 12~25% 区间的实测落点，并把「直映收益」与「DSA 收益」拆开归因 |
+| B3（可选） | 回放 + pwrite 到 commit 文件 | 完整 mem2disk 链路回放 |
+
+- 产物（已实现）：[`replay_offload.c`](replay_offload.c)（单进程工具，`--probe` 三路定位 guest RAM（nonce 内容定位优先 → memfd → anonmap 推断+魔数校验）+ KVM fd + 只读 dirty log，`--arm` 跑三路之一）+ `replay_run.sh`（全自动编排：起沙箱 → 每 round：写魔数 + exec 负载 → probe（运行态）→ 三路回放（运行态）→ pause → resume（留 wall 对账）→ ABBA 交错 → 配对统计；`SMOKE=1` 冒烟）。
+  - 设计要点：① dirty-log 三机制兼容——GET 即清（AgentENV 消费后我们 GET 得空位图 → 退化 whole，口径偏保守）/ manual-protect（真实脏页）/ ring（EINVAL → 退化 whole）；**只 GET 严禁 CLEAR**（保护增量快照链），GET 与消费逐 slot 配对，每轮只 probe 一次。② 沙箱内存 ≤3584MiB（默认 `MEM_MIB=3584`）时 guest RAM 全在单 memslot，消除 slot1 顺序布局假设。③ 段式采样：whole/bitmap 超 `SUBSET_MB` 上限时取「随机段起点 × 连续 256 页（1MB）」而非纯随机页（dd 顺序写使 dirty 大段连续，纯随机会把 pvm 64KB iovec 合并退化成逐页 4KB readv），seed=round 确定性可复现。④ pvm 基线臂按 64KB iovec 合并粒度换算（假设值，`PVM_CHUNK_KB` 可覆盖，待 A1 bpftrace 校准）。⑤ 退出码协议：rc=2 checksum 不一致（编排层 fatal 中止）/ rc=3 DML 臂失败（该轮降级剔除 dsa，不中止）。⑥ RAM 访问三路：nonce 内容定位优先（`--nonce-hex`，guest 每轮制脏前写 `/dev/shm/.b0nonce` 16B 随机数——多 fc 并存且命令行无 uuid 时 find_fc 失效，16B 随机数全机内容搜索可同时定位进程真身与 RAM 段组；实测 patch 版后端为 mmap `/dev/ublkbN` 拆两段地址连续 VMA，匿名大小匹配失效）；无 nonce 时上游 memfd 优先（偷 fd 只读直映）；AgentENV patch 版为匿名 mmap，降级为 `/proc/<pid>/maps` 匿名映射按 slot 大小匹配推断基址（须传 `--guest-mib`，候选非唯一即拒绝）+ 每轮制脏前魔数文件（`DSAB0BASECALIBv1!` ×4096 = 16 页 tmpfs）内容级校验——大小匹配可能被 guard page 偏移骗过，魔数不会，miss 即 NOGO；anon 模式下 mmap/dsa 臂先一次性预取页集合进本地缓冲（计时窗口外，真实场景 orchestrator 直映持有指针零成本），pvm 臂仍走 `process_vm_readv`（它测的就是跨进程读本身）。⑦ **布局校准（错位防御）**：nonce 段组的「线性偏移→hva」映射 = 段组 foff 升序拼接查表（实测 foff 逆序排布，旧 base+off 线性模型整体错位 512MiB、tmpfs 制脏页恰好落被丢的 slot1）；memslot 布局（slot0 字节数 s0）不猜、probe 实测求解——候选 × `.b0loc` 位置编码端到端校验（≥12/16 命中即 GO，全灭 NOGO loc-miss 宁失败不出错数据）；求出的段组排列经 dump 文件尾 `#B0ORDER` 行传给臂进程（臂本地重发现排列未必与 probe 一致，如匿名组正/逆），臂 `load_pages` 后强制按 dump 重排再回放；whole 退化模式无映射校验力（全页集合任意排列都覆盖全部页），loc=n/a 如实留痕。
+  - 状态：合成数据自测 27/27 通过（臂序排列与块序性质、统计输出与手算期望逐字节一致、probe 解析 pipefail 三分支、17 列 CSV 对齐）；待服务器实测出数。
+- 已排除的不可行路线：LD_PRELOAD 拦不住 Go 裸 syscall；ptrace 拦截 syscall 无法干净做跨进程 DSA（数据先得经 kernel 拷一遍，等于没省）。
+
+**跟踪线 C · 干扰实验（证明「释放 vCPU → 业务算力」）**
+
+| 编号 | 做什么 | 回答的问题 |
+|---|---|---|
+| C1 | 合成负载预演（零改动）：同 NUMA 绑核 co-runner（固定工作量循环测吞吐），注入 A 臂实测等量 CPU 负载（674 ms/GB）vs DSA 等效（~76 ms/GB），对比快照窗口内 co-runner 吞吐保留率 | 打通「CPU 占用 → 业务降速 → 释放 → 恢复」因果链（预演版，推测级外推） |
+| C2 | 真实版（等 4.4 B 臂落地）：周期性真实快照 vs 无快照，co-runner 对比 | 真实快照下的同机业务影响 |
+
+> 口径提醒：被暂停沙箱自身的业务在 pause 期间整体停摆，vCPU 释放的可证明对象是**同机其他负载**；沙箱自身的收益路径是缩短 pause wall（~1s 等待，与 DSA 解耦）。
+
+**排序与判定标准**
+
+1. A2 + A3（一次服务器行程）→ 2. B0~B2（核心）→ 3. C1 → 4. A1（随时可做，与 B 并行）。
+- 观察级：A/B/C 的直接测量数；推测级：残差归因（kworker/jbd2）、1s 等待机制、C1 因果链外推。
+- 修正项：copy 占比补系统口径双数值；若系统口径下修 10~13%，PPT 与数据文档同步改。
+
+**4.5 测试模型（自检后固化，B 线及后续 B 臂共同遵守）**
+
+- **臂**：B2 三路——`process_vm_readv` 基线 / mmap 直映 + CPU memcpy / mmap + DSA batch（把「直映收益」与「DSA 收益」拆开归因）。
+- **因子**：D = 64/256/1024MB（+0 对照，顺带补 A 臂 1024 缺口）；S = dd 顺序 dirty vs 真实负载 dirty（B1 捕获）；T = 热（运行态立即回放 COW 页）vs 冷（整段 RAM，保守口径）。
+- **固定并记录**：CPU governor=performance；NUMA 绑定（server / DSA WQ / 回放进程 / commit 文件同 node，numactl 指定并留痕）；沙箱规格与 layer 深度（pause 次数）；后台负载（mpstat 验证 <1%）；perf 平均频率。
+- **执行顺序**：同沙箱内臂间**交错随机化**（ABBA，每 5 轮换序）。教训：4.2 与 4.4 跨沙箱 40% 差异（942 vs 674 ms/GB）大于 B 臂预期效应（9~25%）——改源码 B 臂绝不允许跨天/跨沙箱对比，必须同沙箱配对。
+- **样本量与统计**：n=30/臂（配对 t / Wilcoxon + 95% CI）；按 A 臂 sd≈13% 估，配对可检出 ~7% 差异（80% power）。主指标预注册：E1 搬运 CPU ms/GB（配对差）、E2 系统口径 copy 占比（A2）、E3 co-runner 保留率（C1）；wall 与符号构成列为次级。
+- **Sanity 门**：DSA 回放后 perf 采样中 `copy_page_to_iter` 应基本消失；回放前后 guest 页 checksum 一致；B0 双路（memfd + anonmap 推断）都失败才触发 no-go 转向；nonce 路 `.b0loc` 布局校验全灭 → NOGO loc-miss（memslot 布局与预期不符，宁失败不出错位数据）。
+- **口径限定**：C1 合成负载只复现 CPU 时间占用、不含内存带宽争用——保留率结论限 CPU 归因（推测级）。已知未测记录在案：DSA 多租户容量（8 engine vs 整机 33 GB/s 流量）、单机外推鲲鹏、写侧 kworker/jbd2（A2 在补）；resume 侧宿主开销已纳入 B 线 rounds 留痕（wall + server utime+stime 差分，窗口 = resume 返回点保守下界）。
+
 ## 五、脚本清单
+
+### [measure_resume_baseline.sh](measure_resume_baseline.sh) — 独立resume基线（2026-10-19新增）
+
+仿照measure_copy_share分开做A段CPU扫描与B段符号采样；两段均在同一运行中复用一个沙箱，pause/制脏在计时窗外。每轮轮转dirty档位和窗口顺序，失败保留退出码与stdout/stderr；输出使用唯一run目录，不覆盖已有服务器日志。
+
+先在Linux目标机冒烟（SBX需处于运行态；没有SBX时可用TEMPLATE自动启动）：
+
+```bash
+SBX=<运行中的沙箱ID> REPEAT_A=2 REPEAT_B=1 DIRTY_MB_LIST="0 64" bash measure_resume_baseline.sh
+# 全量默认0/64/256/1024MiB，各20轮；另各60次256MiB符号采样
+SBX=<运行中的沙箱ID> bash measure_resume_baseline.sh
+```
+
+- `WINDOWS="return touch"`：分别测resume命令返回，以及resume后exec校验文件长度并顺序读回全部制脏文件。后者显式触发该文件的懒加载，含exec、guest读文件与调度成本，不等于纯disk2mem或全RAM恢复。`0MiB`仍创建空文件并执行相同就绪/读取路径，作操作性控制，不保证guest零dirty。
+- 默认`SCOPE=process`，`auto`仅为兼容别名，**不自动退回全机采样**。三类角色只在候选唯一时自动选择；多候选需用`SERVER_PIDS/UBLK_PIDS/FIRECRACKER_PIDS`指定已确认属于目标路径的PID。唯一候选也不是沙箱归属的内容级证明，需结合部署确认。PID、starttime及边界线程集合变化则事件无效；若resume新建FC，当前进程方案不能给出完整占比，需另做目标cgroup/生命周期归属方案，不以全机数据冒充。
+- 关闭继承避免重叠计数；进程集合外的其他进程不计入，但系统异步worker不在本口径内，边界之间瞬态线程也可能漏掉。共享server/ublk内其他请求无法靠PID区分，运行时应暂停并发管理操作，优先专用测试实例。显式`SCOPE=system`仅诊断，分析器禁止将其标为可推演输入。
+- 每事件前对相同目标进程做`BG_SEC=1`秒空闲CPU测量，按操作窗口时长估算背景比例；超过`MAX_BACKGROUND_RATIO=0.10`则事件无效。这是噪声筛查，不是背景扣除或零干扰证明。
+- 默认不清宿主page cache、不改sysctl、不接触dirty-log。pause/resume多轮会改变layer/cache状态；dirty量是请求制脏量，不能当作物理读盘量。`wall_ms`包含perf/辅助进程启动退出，不能直接与旧CLI-only wall混比。
+- 把`analyze_resume_baseline.py`与shell脚本放在同一目录，结束时自动生成`composition.md/csv`（互斥操作符号类别、合并占比、事件均值、按事件重采样95%区间）、`composition_events.csv`、逐符号明细和`inference_inputs.json`。B段显式采样`cpu-clock`，`--no-children`避免父子栈重复计数；长尾和未解析样本保留，禁止把未解析当copy=0。分类是self符号归类，不是精确syscall耗时或DSA可卸载比例，需要依据真实长尾继续审计。
+- 默认推演质量门禁：每组至少20个有效符号事件、20000样本、同窗口/dirty/PID的至少20个A段事件、未解析≤5%、有已解析内核样本，且报告解析无异常/已识别丢样。通过仍需确认PID归属及共享进程无并发请求；不是已经证明无干扰。
+- 推演只能条件性地用类别占比乘**同窗口、同dirty、同PID集合的平均总CPU**，不能直接乘dirty回归斜率。OLS与事件重采样区间不覆盖所有分类/环境误差。原始产物写入唯一run目录，既有服务器日志无需重做或覆盖。
 
 > 各阶段实测结果留痕见 [results/](results/README.md)，本文档只保留结论摘要与指针。
 
@@ -260,6 +355,35 @@ sudo accel-config disable-device dsa2
 - **用法**：`TEMPLATE=<模板名> bash baseline_pause_sweep.sh`；短版 `REPEAT=3`；OCI 镜像 `COLD=1 CPU_COUNT=4 MEM_MIB=8192`（guest 内存 ≥ 最大 dirty 档 ×1.5）；跑完删沙箱 `CLEANUP=1`。输出 `results/stage4-sandbox/baseline_sweep*.csv` + `perf/`。
 - **口径**：wall = `aenv pause` 命令耗时（含 CLI 往返，A/B 同口径）；CPU = orchestrator(server) 的 task-clock（对照 4.2 的 942 ms/GB）；dirty 只写 guest tmpfs，禁止写盘（overlaybd CoW 坑）。汇总自动剔除 `perfrec` 行（profiling 使 wall +2.2s）并打印「疑似漏 dirty」告警（dirty>0 但 taskclk≈0）。
 
+### [bpftrace_pause_attribution.bt](bpftrace_pause_attribution.bt) — 阶段 4.5 · A1 路径归因
+
+- **性质**：eBPF 透明插桩，零源码改动，纯只读观测，需 root + bpftrace。
+- **内容**：按进程名归因 `process_vm_readv`（耗时/次数/字节数）、`vfs_write`（kprobe，同时覆盖 pwrite 与 io_uring 提交路径）、`fsync/fdatasync`（1s 等待若源于落盘在此显形）；对 `copy_page_to_iter` / `copy_page_from_iter_atomic` 做 kretprobe 精确计时（真实 memory movement 直接计量）。
+- **用法**：`sudo bpftrace bpftrace_pause_attribution.bt`，另开终端触发一次 `aenv pause`，Ctrl-C 出汇总（ns/1e6=ms）。一次归因一个 pause 窗口。
+- **注意**：`copy_page_from_iter_atomic` 在部分内核被内联，probe 报不存在则删对应段，用 `perf record -a -g` 兜底。
+
+### [calibrate_cpu_scope.sh](calibrate_cpu_scope.sh) — 阶段 4.5 · A2 全机口径标定
+
+- **性质**：零源码改动；scene 模式只读 + 运行既有二进制，pause 模式触发一次 pause。
+- **内容**：`/proc/stat` 差分（user+nice+sys+irq+softirq+steal）= 全机 CPU，对比进程侧（scene：`perf stat task-clock` 包住命令；pause：server 的 utime+stime 差分），残差 ≈ kworker 回写 + jbd2 + irq（推测级）。
+- **用法**：`sudo ./calibrate_cpu_scope.sh scene -- ./dsa_disk_scene <参数>`；`sudo ./calibrate_cpu_scope.sh pause <sandbox_id>`；`PERFREC=1` 附带 `perf record -a -g`（A3 用），`SERVER_PID` 可覆盖 orchestrator 进程。每模式跑 3 次取中位。
+- **产出**：进程 vs 全机 CPU 对比 + 残差；系统口径 copy 占比换算提示（mem2disk：56.0 / (56.0+158.9+残差ms/GB)）。
+
+### [replay_offload.c](replay_offload.c) — 阶段 4.5 · B 线单进程回放工具
+
+- **性质**：零源码改动的单进程工具；经 `pidfd_open`/`pidfd_getfd`（内核 ≥5.6，需 root）从 firecracker 进程取得 guest RAM 的 memfd 与 KVM VM fd；运行态（pause 之前）读 firecracker 的 guest RAM COW 页（pause 会 unmap 掉它），在 AgentENV 之外重放同一段搬运，测真实页分布下的收益。
+- **内容**：`--probe` 模式（B0+B1）：`/proc/<pid>/fd` readlink 发现 memfd（前缀 `/memfd:`）与 KVM VM fd（`anon_inode:kvm-vm`）→ mmap 直映 → 只读 `KVM_GET_DIRTY_LOG` 提取脏页集合（**严禁 CLEAR**，三机制兼容见 4.5），超上限时段式采样，`--dump-pages` 落盘页表（nonce 模式尾行 `#B0ORDER foff|asc|desc` = 段组排列模型，臂进程据此重排映射）；nonce 段组模式位图换算先做 **memslot 布局求解**（候选 s0 × 匿名组正逆排列 → `.b0loc` 位置编码端到端校验 ≥12/16 命中才接受，全灭 NOGO loc-miss，方法详见 [qa.md](qa.md)）；`--arm` 模式（B2）：对同一批页跑 pvm 基线 / mmap+memcpy / mmap+DML batch（N≥48）三路之一，`--repeat` 次内部重复，每次搬完做 guest 页 checksum 自校验。
+- **用法**：`sudo ./replay_offload --fc-pid <pid> --probe --dump-pages <file> [--subset-mb 256] [--seed 1]`；`sudo ./replay_offload --fc-pid <pid> --arm pvm|mmap|dsa --pages <file> [--repeat 5] [--cold 1]`。由 `replay_run.sh` 自动调用，无需手工单跑。GO 行（nonce 路）字段：`ram_src=nonce ram_mib=<实测MiB> segs=<段数> order=<foff|asc|desc> file=<后端> kvmvm=<0|1> magic=hit@0x<偏移> loc=<n/16|n/a> s0=<MiB>`——`loc=n/a` 表示 whole 退化（无映射校验力，口径保守）；NOGO `reason=loc-miss` = 所有布局候选校验全灭（错位防御触发，宁失败不出错数据）。
+- **口径**：CPU = `CLOCK_PROCESS_CPUTIME_ID`，wall = `CLOCK_MONOTONIC`；13 列 CSV（arm,src,pages,mb,chunk_kb,flush,irep,cpu_ms,wall_ms,cpu_ms_per_gb,cpu_util,cksum,note）；退出码 0 正常 / 1 参数错 / 2 checksum 不一致（编排层 fatal）/ 3 DML 臂失败（编排层降级剔除该轮 dsa）。
+- **编译**：`gcc -O2 -Wall -DUSE_DML -I"$HOME/.local/include" replay_offload.c -L"$HOME/.local/lib" -ldml -ldmlhl -luuid -pthread -o replay_offload`（无 DSA 环境去掉 `-DUSE_DML` 可跑 pvm/mmap 两臂）。
+
+### [replay_run.sh](replay_run.sh) — 阶段 4.5 · B 线全自动编排
+
+- **性质**：一键跑完 4.5 测试模型 B 线，零人工操作（规避手测误差）；`SMOKE=1` 冒烟模式（64MB × 2 轮 × 2 reps，验通路不出数）；编译自含。
+- **内容**：起沙箱（`aenv start`，规格留痕）→ 编译 → 每 round：ABBA 臂序（块=5 轮，块间反转 + 块内确定性洗牌、块内同序）→ 写哨兵三件套（`.b0magic` 魔数 16 页 + `.b0nonce` 16B 随机数读回 + `.b0loc` 16 页位置编码，各带 stat 自检 WARN）→ exec 负载（dd 顺序写制造 dirty）→ probe（运行态）→ 三路回放（各 `ARM_REPEAT` reps，rc=2 fatal / rc=3 降级剔 dsa）→ `aenv pause` → `aenv resume`（留 wall 对账）；结束输出 round 均值 → 臂级 mean/sd/95%CI → **同沙箱配对差值**（缺臂轮自动配对降级并 WARN）；cksum≠1 行剔除；环境留痕 `replay_env.txt` 20 项（governor / NUMA 绑定 / 沙箱模板 / arms / dirty 档位 / pvm_chunk_kb 假设标注 / gcc / LD_LIBRARY_PATH 等）；resume 窗口同步留痕（wall + server 进程 utime+stime 差分 ms，进 `replay_rounds.csv`，窗口 = resume 返回点保守下界）。
+- **用法**：`TEMPLATE=<模板名> sudo -E bash replay_run.sh`（全量：64/256/1024 MB × 30 轮）；`TEMPLATE=<模板名> SMOKE=1 sudo -E bash replay_run.sh`（冒烟）。可调参数：`DIRTY_MB_LIST / REPEAT / ARM_REPEAT / ABBA_BLOCK / FLUSH / SUBSET_MB / PVM_CHUNK_KB / BATCH_N / DSA_WAIT / COLD / CPU_COUNT / MEM_MIB / CLEANUP / FIRECRACKER_PID`（默认值见脚本头注释）。产物落 `results/stage4-sandbox/`：`replay_detail/rounds/summary/paired` CSV + `replay_env/replay_err` 留痕 + `replay_pages/` 页表。
+- **状态**：合成数据自测 27/27 通过；待服务器实测出数（跑前确认 DML `LD_LIBRARY_PATH`，见风险 #4）。
+
 ### [dsa_bench.cc](dsa_bench.cc) — DSA vs CPU 基准测试（阶段 2）
 
 - **性质**：Google Benchmark 程序，对比三种路径的 memcpy/memset：glibc CPU 基线、DML software、DML hardware（DSA）。
@@ -287,11 +411,14 @@ sudo accel-config disable-device dsa2
 
 ## 七、当前进度
 
+> 以下清单保留历史阶段记录，当前数值与待办以[CURRENT_STATUS.md](CURRENT_STATUS.md)为准：旧942/674与ext4约55%停用；真实pause已有新汇总、原始证据待归档；resume与真实DSA端到端A/B尚未完成。
+
 - ✅ 阶段 0 完成（探测 + 结论已沉淀到本文档）。
 - ✅ 阶段 1 完成（DSA 已启用，`/dev/dsa` 节点生成）。
 - ✅ 阶段 2 完成（数据搬运部分）：memcpy 吞吐对比已出（盈亏平衡 ~1MB，见上文）；fill/compare/delta/CRC 不在研究范围，已排除。
 - ✅ 阶段 3 完成：真异步释放 89.76% + 4KB Batch（N≥48 反超 CPU 5~11 倍），见上文。
 - ✅ 阶段 4.1 完成：散落页 batch 物理前提成立 + 页温度（5~11× 仅冷页成立），见上文。
 - ✅ 阶段 4.2 完成：AgentENV snapshot 搬运路径坐实（`process_vm_readv` + `pwrite`，942ms/GB）；DSA 卸载 4KB 页有正收益（busy-poll +78.4%，「负收益」是 usleep 假象）；异步等待已源码查证（AgentENV 同步搬运 + io_uring 可用），见上文。
-- 🚧 阶段 4.4 进行中：A 臂基线 0/64/256MB 已测（wall 含 ~1s 固定等待、CPU ≈ 674 ms/GB、目标口径已修正，见 4.4；1024/2048 待补）。待推进：Rust FFI PoC（4.3）、B/C 臂接入与 A/B 对比（4.4）。
-- ⏸ 阶段 5 待推进。
+- 🚧 阶段 4.4 A 臂基线：0/64/256MB 已测（wall 含 ~1s 固定等待、CPU ≈ 674 ms/GB，见 4.4；1024/2048 待补）。4.3（Rust FFI）与 4.4 B/C 臂（改源码 A/B）已后移——待 4.5 透明插桩出数后启动。
+- 🚧 阶段 4.5 进行中（透明插桩，leader 确认不改 AgentENV 源码）：A 线观测与口径闭合（bpftrace + calibrate 已就绪）、B 线运行态回放已实现（`replay_offload.c` + `replay_run.sh`，合成数据自测 27/27 通过，待服务器实测出数）、C 线干扰实验待做，见 4.5。
+- ⏸ 阶段 5（结论报告）待推进。

@@ -1,4 +1,5 @@
 # AgentENV snapshot memory 搬运路径 —— 阶段 4.2 实测
+# 状态：真实pause的942/ext4约55%为污染历史，停用；独立微基准行另按各自条件解释。当前见../../CURRENT_STATUS.md。
 # 日期: 2026-10-12  机器: 8480+ (Sapphire Rapids)
 # 对象: kvcache-ai/AgentENV (Firecracker 沙箱平台), sandbox 01a13011-df12-7502-a228-7cbd87cc414c
 # 方法: perf stat (task-clock) 只包 aenv pause + perf record 采样 orchestrator(server:3016) + ublk(uvm-ublk-daemon:3936)

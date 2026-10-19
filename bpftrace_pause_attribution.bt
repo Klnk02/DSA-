@@ -1,0 +1,109 @@
+#!/usr/bin/env bpftrace
+/*
+ * 阶段 4.5 · A1 —— 真实 pause 搬运路径归因（透明插桩，零源码改动）
+ * 仓库：DSA-/bpftrace_pause_attribution.bt
+ *
+ * 用法：
+ *   sudo bpftrace bpftrace_pause_attribution.bt
+ *   另开终端触发一次 aenv pause <sandbox_id>，pause 完成后 Ctrl-C，
+ *   输出按进程名归因的窗口汇总（ns / 1e6 = ms）。
+ *   一次只归因一个 pause 窗口。
+ *
+ * 归因对象：
+ *   - process_vm_readv   跨进程搬运 guest 内存（capture 读取路径，4.2 坐实）
+ *   - vfs_write          写 commit 文件（kprobe 同时覆盖 pwrite 与 io_uring 两条提交
+ *                        路径；io_uring worker 线程名为 iou-wrk-<pid>，故按 comm 分组
+ *                        而不是只过滤 server）
+ *   - fsync/fdatasync    若 ~1s 固定等待源于落盘，在此显形（4.4 发现 1 的遗留问题）
+ *   - copy_page_to_iter / copy_page_from_iter_atomic
+ *                        真实 memory movement 的直接计量（拷贝子路径精确 CPU）
+ *
+ * 注意：
+ *   1. copy_page_from_iter_atomic 在部分内核被内联，若启动报 probe 不存在，
+ *      删除对应段即可，用 perf record -a -g 兜底采样。
+ *   2. probe 名可预检：bpftrace -l 'tracepoint:syscalls:*vm_read*'
+ *                      bpftrace -l 'kprobe:copy_page*'
+ *   3. 输出的 map 自动在 Ctrl-C 时打印；ns 除以 1e6 得 ms。
+ */
+
+BEGIN
+{
+    printf("=== DSA 阶段 4.5 A1：pause 路径透明归因（已挂载）===\n");
+    printf("另开终端触发 aenv pause，完成后 Ctrl-C。汇总单位 ns（/1e6 = ms）\n\n");
+}
+
+/* ---------- 跨进程搬运 syscall：process_vm_readv ---------- */
+tracepoint:syscalls:sys_enter_process_vm_readv
+{
+    @t_vmr[tid] = nsecs;
+}
+tracepoint:syscalls:sys_exit_process_vm_readv
+/@t_vmr[tid]/
+{
+    @vmr_ns[comm]    = sum(nsecs - @t_vmr[tid]);
+    @vmr_calls[comm] = count();
+    @vmr_bytes[comm] = sum(args->ret);
+    delete(@t_vmr[tid]);
+}
+
+/* ---------- 落盘：vfs_write（覆盖 pwrite 与 io_uring，按 comm 归因）---------- */
+kprobe:vfs_write
+{
+    @t_vw[tid]    = nsecs;
+    @vw_comm[tid] = comm;
+}
+kretprobe:vfs_write
+/@t_vw[tid]/
+{
+    @vw_ns[@vw_comm[tid]]    = sum(nsecs - @t_vw[tid]);
+    @vw_calls[@vw_comm[tid]] = count();
+    delete(@t_vw[tid]);
+    delete(@vw_comm[tid]);
+}
+
+/* ---------- fsync / fdatasync（4.4 发现 1 的 ~1s 等待若源于落盘，在此显形）---------- */
+tracepoint:syscalls:sys_enter_fsync,
+tracepoint:syscalls:sys_enter_fdatasync
+{
+    @t_sync[tid]     = nsecs;
+    @sync_comm[tid]  = comm;
+    @sync_enter[comm] = count();
+}
+tracepoint:syscalls:sys_exit_fsync,
+tracepoint:syscalls:sys_exit_fdatasync
+/@t_sync[tid]/
+{
+    @sync_ns[@sync_comm[tid]]    = sum(nsecs - @t_sync[tid]);
+    @sync_calls[@sync_comm[tid]] = count();
+    delete(@t_sync[tid]);
+    delete(@sync_comm[tid]);
+}
+
+/* ---------- 真实 memory movement：内核拷贝符号精确计时 ---------- */
+kprobe:copy_page_to_iter
+{
+    @t_cpti[tid]      = nsecs;
+    @cpti_comm[tid]   = comm;
+}
+kretprobe:copy_page_to_iter
+/@t_cpti[tid]/
+{
+    @cpti_ns[@cpti_comm[tid]]    = sum(nsecs - @t_cpti[tid]);
+    @cpti_calls[@cpti_comm[tid]] = count();
+    delete(@t_cpti[tid]);
+    delete(@cpti_comm[tid]);
+}
+
+kprobe:copy_page_from_iter_atomic
+{
+    @t_cpfi[tid]    = nsecs;
+    @cpfi_comm[tid] = comm;
+}
+kretprobe:copy_page_from_iter_atomic
+/@t_cpfi[tid]/
+{
+    @cpfi_ns[@cpfi_comm[tid]]    = sum(nsecs - @t_cpfi[tid]);
+    @cpfi_calls[@cpfi_comm[tid]] = count();
+    delete(@t_cpfi[tid]);
+    delete(@cpfi_comm[tid]);
+}

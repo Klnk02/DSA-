@@ -1,0 +1,22 @@
+# 【历史合成表，停用】基于已替代/污染的942等分母；不得作为当前收益证据，见 ../../CURRENT_STATUS.md
+# snapshot = 60MB 的 mem2disk / disk2mem onCPU 模拟表（合成自既有实测数据，2026-10-19）
+# 引用时必须带下面三条性质说明（否则会被追问「数怎么来的」）：
+#   [1] 基础实测 = results/stage4-sandbox/snapshot_offload.csv（2026-10-12 真实 pause 事件，perf task-clock 5 次均值）
+#       固定开销 53.32 ms；搬运 942 ms/GiB（=(288.94-53.32)/0.25GiB）；符号构成：copy 段 12.64% / ext4 簿记 ~55% / 页表+元数据 ~32%
+#   [2] hop 段实测 = stage2 CPU memcpy 82.9 ms/GiB  vs  stage3 DSA_async 8.5 ms/GiB（同口径）
+#       灵敏度（冷散落 4KB）：CPU 112.7 vs DSA 24.4(busy) / 9.4(64KB async) ms/GiB
+#   [3] 线性外推假设：60MB 档 = 固定开销 + 942×60/1024，小尺寸固定开销摊薄未实测；
+#       跨次方差警示：同机 2026-10-14 扫描同 256MB 档为 165.0 ms/次（0MB 基线≈0），折算 660 ms/GiB，与 4.2 的 942 差 1.4x
+#       → 故给两列口径：主=4.2，下界=扫描。两者都远大于 hop 段，结论（DSA 只能碰小头）不受影响
+# 结构口径：current_* = AgentENV 现状（内核两跳：process_vm_readv copy_to_user + pwrite copy_from_iter，DSA 结构不可介入）
+#          assumed_staging_hop = 假设上游改造成「经 staging 缓冲」（此时才有用户态跳可被 DML 替换）
+scenario,structure,sw_oncpu_ms_snapshot,dsa_oncpu_ms_snapshot,delta_ms,delta_pct,source
+mem2disk,current_kernel_two_hops,108.52,108.52,0.00,0.0,[1]线性外推(4.2口径);DSA无用户态跳可替→收益0
+mem2disk,current_kernel_two_hops_sweep_lowerbound,38.67,38.67,0.00,0.0,[3]10-14扫描660ms/GiB外推;下界;同样0收益
+mem2disk,assumed_staging_hop,113.38,109.02,-4.36,-3.8,[1]+[2]现状+用户态memcpy(82.9) vs 现状+DML(8.5)
+mem2disk,data_move_segment_only_upperbound,13.72,0.50,-13.22,-96.4,[1]copy段12.64% vs [2]DSA;理论上限,内核拷贝不可被DSA取代,仅示意
+disk2mem,current_kernel_two_hops,108.52,108.52,0.00,0.0,[1]对称假设(恢复侧尚未实测,待MODE=resume验证)
+disk2mem,current_kernel_two_hops_sweep_lowerbound,38.67,38.67,0.00,0.0,[3]对称假设;下界
+disk2mem,assumed_staging_hop,113.38,109.02,-4.36,-3.8,[1]+[2]同 mem2disk
+disk2mem,data_move_segment_only_upperbound,13.72,0.50,-13.22,-96.4,[1]+[2]理论上限,同上
+mem2mem,reference_pure_memory_hop,4.86,0.50,-4.36,-89.8,[2]82.9 vs 8.5 按60MB折算;参照臂

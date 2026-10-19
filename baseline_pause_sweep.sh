@@ -17,8 +17,11 @@
 #   guest 内存 >= 最大 dirty 档 x 1.5（不够就 COLD=1 + MEM_MIB=8192 起新沙箱）
 #
 # 用法：
-#   TEMPLATE=my-ubuntu bash baseline_pause_sweep.sh            # 全量：0/64/256/1024/2048 MB x 20 次
+#   TEMPLATE=my-ubuntu bash baseline_pause_sweep.sh            # 全量：0/64/256/1024/2048 MB x 20 次（pause 方向）
 #   TEMPLATE=my-ubuntu REPEAT=3 bash baseline_pause_sweep.sh   # 短版先验链路
+#   MODE=resume TEMPLATE=my-ubuntu bash ...                    # 反向：测「恢复」窗口（disk2mem 方向）
+#                                                             #   每 rep 先 pause 造增量快照，再包住 resume 窗口
+#                                                             #   被测进程集合 = server + fc + uvm-ublk-daemon
 #   CLEANUP=1 bash ...                                         # 跑完删沙箱
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -33,6 +36,10 @@ REPEAT="${REPEAT:-20}"
 PERF_SAMPLE_EVERY="${PERF_SAMPLE_EVERY:-7}"  # 每 7 次抽 1 次 perf record 留符号
 OUT_DIR="results/stage4-sandbox"
 GUEST_DIRTY=/dev/shm/aenv_dirty              # guest 内的 dirty 文件（tmpfs）
+MODE="${MODE:-pause}"                        # pause = mem2disk 方向（快照/卸载 guest RAM）
+                                             # resume = disk2mem 方向（恢复：layer→guest RAM）
+                                             # 两方向真实路径都在内核里搬，DSA 都插不进去；
+                                             # 分别扫一遍才有「真实基线」可用（README §4.5）
 
 command -v aenv >/dev/null 2>&1 || { echo "ERROR: aenv CLI 不在 PATH"; exit 1; }
 command -v perf >/dev/null 2>&1 || { echo "ERROR: perf 不可用"; exit 1; }
@@ -40,13 +47,37 @@ command -v perf >/dev/null 2>&1 || { echo "ERROR: perf 不可用"; exit 1; }
 # ---------------- 进程发现（4.2 实测时进程名即 server / uvm-ublk-daemon） ----------------
 find_server_pid() { pgrep -x server | head -1 || true; }
 find_ublk_pid()   { pgrep -f uvm-ublk-daemon | head -1 || true; }
+# firecracker 仅在唯一时可信（多沙箱共享机上 pgrep 拿不到本沙箱真身）；
+# resume 方向的缺页发生在 fc 进程里，拿不到就如实标 n/a（那是口径下界，不是 0）
+find_fc_pid() {
+    local n; n="$(pgrep -x firecracker 2>/dev/null | wc -l || true)"
+    [ "${n//[[:space:]]/}" = "1" ] && pgrep -x firecracker | head -1 || true
+}
 SERVER_PID="$(find_server_pid)"
 UBLK_PID="$(find_ublk_pid)"
+FIRECRACKER_PID="${FIRECRACKER_PID:-$(find_fc_pid)}"
 if [ -z "$SERVER_PID" ]; then
     echo "ERROR: 找不到 orchestrator(server) 进程，确认 aenv server 在跑（Docker 部署也一样能看到）"
     exit 1
 fi
-echo "orchestrator(server) = pid $SERVER_PID ; ublk = ${UBLK_PID:-none}"
+# 被测进程集合：resume 方向把 fc 与 ublk 一起包进来（恢复路径横跨三者），
+# pause 方向与 4.2 对齐只包 server（保持历史口径可比）
+if [ "$MODE" = "resume" ]; then
+    PERF_PIDLIST="$SERVER_PID${FIRECRACKER_PID:+,$FIRECRACKER_PID}${UBLK_PID:+,$UBLK_PID}"
+    [ -n "$FIRECRACKER_PID" ] || echo "WARN: fc 不唯一或未找到 → resume 口径不含 fc 缺页 CPU（下界，如实标注）"
+else
+    PERF_PIDLIST="$SERVER_PID"
+fi
+echo "mode=$MODE ; orchestrator(server) = pid $SERVER_PID ; ublk = ${UBLK_PID:-none} ; fc = ${FIRECRACKER_PID:-none}"
+echo "被测进程集合 = $PERF_PIDLIST"
+
+if [ "$MODE" = "resume" ]; then
+    OUT="$OUT_DIR/baseline_resume_sweep.csv"
+    SUM="$OUT_DIR/baseline_resume_sweep_summary.csv"
+else
+    OUT="$OUT_DIR/baseline_sweep.csv"
+    SUM="$OUT_DIR/baseline_sweep_summary.csv"
+fi
 
 # ---------------- 沙箱准备（整轮复用一个，pause/resume 循环） ----------------
 start_args=(-d)
@@ -76,43 +107,66 @@ make_dirty_mb() {                            # guest 内写 $1 MB tmpfs（0 = �
 }
 
 # ---------------- 主循环 ----------------
-OUT="$OUT_DIR/baseline_sweep.csv"
-SUM="$OUT_DIR/baseline_sweep_summary.csv"
 mkdir -p "$OUT_DIR/perf"
-echo "ts,dirty_mb,rep,pause_wall_ms,server_taskclk_ms,server_cycles_m,note" > "$OUT"
+if [ "$MODE" = "resume" ]; then
+    # 列名随方向变，列位保持不变（汇总 awk 按列位取数）
+    echo "ts,dirty_mb,rep,resume_wall_ms,restore_taskclk_ms,restore_cycles_m,note" > "$OUT"
+else
+    echo "ts,dirty_mb,rep,pause_wall_ms,server_taskclk_ms,server_cycles_m,note" > "$OUT"
+fi
 
 for mb in $DIRTY_MB_LIST; do
     echo "===== dirty = ${mb} MB ====="
     for i in $(seq 1 "$REPEAT"); do
-        if [ "$PAUSED" -eq 1 ]; then aenv resume "$SBX"; PAUSED=0; fi
-        make_dirty_mb "$mb"
-        sleep 1                              # 等 dirty log 稳定
-
-        t0=$(date +%s%N)
-        aenv pause "$SBX" & tp=$!
+        if [ "$MODE" = "pause" ]; then
+            # ---- mem2disk 方向：直接测 pause 窗口（4.2 口径） ----
+            if [ "$PAUSED" -eq 1 ]; then aenv resume "$SBX"; PAUSED=0; fi
+            make_dirty_mb "$mb"
+            sleep 1                          # 等 dirty log 稳定
+            t0=$(date +%s%N)
+            aenv pause "$SBX" & tp=$!
+            PHASE="pause"
+        else
+            # ---- disk2mem 方向：先 pause（造增量快照 + 让 guest RAM 从 fc 撤出），
+            #      再测 resume 窗口 —— 恢复路径就是要从 layer 把数据搬回 guest，
+            #      pause 本身不计入窗口（它的 wall 记在 note 里，可对账） ----
+            make_dirty_mb "$mb"
+            sleep 1
+            pt0=$(date +%s%N)
+            aenv pause "$SBX"
+            pt1=$(date +%s%N)
+            PREPAUSE_MS=$(( (pt1 - pt0) / 1000000 ))
+            PAUSED=1
+            t0=$(date +%s%N)
+            aenv resume "$SBX" & tp=$!
+            PHASE="resume"
+        fi
         rec=""
         if [ $(( i % PERF_SAMPLE_EVERY )) -eq 1 ]; then
-            pids="$SERVER_PID${UBLK_PID:+,$UBLK_PID}"
-            perf record -F 999 -g -p "$pids" \
-                -o "$OUT_DIR/perf/dirty${mb}mb_rep${i}.data" \
+            perf record -F 999 -g -p "$PERF_PIDLIST" \
+                -o "$OUT_DIR/perf/${PHASE}_dirty${mb}mb_rep${i}.data" \
                 -- tail --pid="$tp" -f /dev/null >/dev/null 2>&1 || true &
             rec=$!
         fi
-        # task-clock(ms) + cycles，恰好覆盖 pause 窗口（tail 随 aenv pause 退出而退出）
-        stat_out=$(perf stat -p "$SERVER_PID" -x, -e task-clock,cycles \
+        # task-clock(ms) + cycles，恰好覆盖窗口（tail 随 aenv pause/resume 退出而退出）
+        stat_out=$(perf stat -p "$PERF_PIDLIST" -x, -e task-clock,cycles \
             -- tail --pid="$tp" -f /dev/null 2>&1 || true)
         if [ -n "$rec" ]; then wait "$rec" || true; fi
         wait "$tp"
         t1=$(date +%s%N)
-        PAUSED=1
+        if [ "$MODE" = "pause" ]; then PAUSED=1; else PAUSED=0; fi
 
         wall_ms=$(( (t1 - t0) / 1000000 ))
         taskclk=$(awk -F, '$3 ~ /task-clock/ {v=$1+0; if ($2 ~ /^sec$/) v*=1000; printf "%.1f", v; exit}' <<<"$stat_out")
         cycm=$(awk    -F, '$3 ~ /cycles/     {printf "%.1f", $1/1e6; exit}' <<<"$stat_out")
         if [ -z "$taskclk" ]; then echo "  WARN: task-clock 为空（perf 权限 / 进程号?）"; fi
 
-        echo "$(date +%F_%T),${mb},${i},${wall_ms},${taskclk},${cycm},${rec:+perfrec}" >> "$OUT"
-        echo "  rep ${i}: wall=${wall_ms}ms  server_taskclk=${taskclk:-?}ms"
+        note=""
+        [ "$MODE" = "resume" ] && note="mode=resume"
+        [ -n "$rec" ] && note="${note:+$note; }perfrec"
+        [ "$MODE" = "resume" ] && note="${note:+$note; }pre_pause_wall=${PREPAUSE_MS}ms"
+        echo "$(date +%F_%T),${mb},${i},${wall_ms},${taskclk},${cycm},${note}" >> "$OUT"
+        echo "  rep ${i}: ${PHASE} wall=${wall_ms}ms  taskclk=${taskclk:-?}ms"
     done
 done
 
@@ -153,5 +207,11 @@ echo "detail  -> $OUT"
 echo "summary -> $SUM"
 cat "$SUM"
 echo
-echo "提示: 纯搬运 CPU = taskclk_avg(dirty=N) - taskclk_avg(0)，再除以 N/1024 GB 得 ms/GB"
-echo "      （对照 4.2: 256MB 档 (288.94-53.32)/0.25 = 942 ms/GB）"
+if [ "$MODE" = "resume" ]; then
+    echo "提示: 恢复侧（disk2mem）纯搬运 CPU 同样用「taskclk_avg(dirty=N) − taskclk_avg(0)」除以 N/1024 GB"
+    echo "      口径限定: 被测集合含 fc 缺页 + ublk 伺候 + orchestrator；DSA 在这条路径上结构不可介入"
+    echo "      （搬运全在内核: ublk/overlaybd 读 + 映射缺页），故这里是「真实软件基线」，不是 DSA 可行域"
+else
+    echo "提示: 纯搬运 CPU = taskclk_avg(dirty=N) - taskclk_avg(0)，再除以 N/1024 GB 得 ms/GB"
+    echo "      （对照 4.2: 256MB 档 (288.94-53.32)/0.25 = 942 ms/GB）"
+fi
